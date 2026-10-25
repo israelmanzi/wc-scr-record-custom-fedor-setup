@@ -41,9 +41,6 @@ struct Status {
     mode: Mode,
     session: String,
     elapsed: String,
-    chunks: String,
-    free: String,
-    audio: String,
     preview: String,
 }
 
@@ -57,15 +54,17 @@ impl Status {
 struct Session {
     name: String,
     duration: String,
-    size: String,
     status: String,
 }
 
 enum Msg {
     Status(Status),
     Sessions(Vec<Session>),
-    Paths { output_dir: String, config_path: String },
-    Done(String),
+    Paths {
+        output_dir: String,
+        config_path: String,
+    },
+    Done,
     Error(String),
 }
 
@@ -88,8 +87,9 @@ struct App {
     status: Status,
     sessions: Vec<Session>,
     audio: AudioMode,
+    show_settings: bool,
     busy: bool,
-    message: Option<(String, bool, Instant)>,
+    error: Option<(String, Instant)>,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
 }
@@ -192,14 +192,10 @@ fn parse_status(raw: &str) -> Status {
 
     for line in raw.lines() {
         if let Some((key, value)) = line.split_once(':') {
-            let value = value.trim().to_string();
             match key.trim() {
-                "session" => status.session = value,
-                "elapsed" => status.elapsed = value,
-                "chunks" => status.chunks = value,
-                "free" => status.free = value,
-                "audio" => status.audio = value,
-                "preview" => status.preview = value,
+                "session" => status.session = value.trim().to_string(),
+                "elapsed" => status.elapsed = value.trim().to_string(),
+                "preview" => status.preview = value.trim().to_string(),
                 _ => {}
             }
         }
@@ -220,7 +216,6 @@ fn parse_sessions(raw: &str) -> Vec<Session> {
         sessions.push(Session {
             name: fields[0].to_string(),
             duration: fields[1].to_string(),
-            size: fields[2].to_string(),
             status: fields[3..].join(" "),
         });
     }
@@ -228,11 +223,43 @@ fn parse_sessions(raw: &str) -> Vec<Session> {
     sessions
 }
 
-fn spawn_rec(tx: Sender<Msg>, rec: PathBuf, args: Vec<String>, success: &'static str) {
+fn session_label(name: &str) -> String {
+    let base = name
+        .strip_prefix("webcam-")
+        .or_else(|| name.strip_prefix("screen-"))
+        .unwrap_or(name);
+
+    if let Some((date, time)) = base.split_once('_') {
+        let date = date.get(5..).unwrap_or(date);
+        let hours = time.get(0..2).unwrap_or("");
+        let minutes = time.get(3..5).unwrap_or("");
+        if hours.len() == 2 && minutes.len() == 2 {
+            return format!("{date} {hours}:{minutes}");
+        }
+    }
+
+    name.to_string()
+}
+
+fn session_mode(name: &str) -> &'static str {
+    if name.starts_with("webcam-") {
+        "webcam"
+    } else if name.starts_with("screen-") {
+        "screen"
+    } else {
+        "session"
+    }
+}
+
+fn is_recoverable(status: &str) -> bool {
+    status.contains("chunks")
+}
+
+fn spawn_rec(tx: Sender<Msg>, rec: PathBuf, args: Vec<String>) {
     thread::spawn(move || {
         match Command::new(rec).args(args).output() {
             Ok(output) if output.status.success() => {
-                let _ = tx.send(Msg::Done(success.to_string()));
+                let _ = tx.send(Msg::Done);
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -250,17 +277,22 @@ fn spawn_rec(tx: Sender<Msg>, rec: PathBuf, args: Vec<String>, success: &'static
     });
 }
 
-fn spawn_open(tx: Sender<Msg>, path: PathBuf, success: &'static str) {
+fn spawn_open(tx: Sender<Msg>, path: PathBuf) {
     thread::spawn(move || {
         match Command::new("xdg-open").arg(path).spawn() {
             Ok(_) => {
-                let _ = tx.send(Msg::Done(success.to_string()));
+                let _ = tx.send(Msg::Done);
             }
             Err(error) => {
                 let _ = tx.send(Msg::Error(error.to_string()));
             }
         }
     });
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 impl App {
@@ -280,22 +312,25 @@ impl App {
             status: Status::default(),
             sessions: Vec::new(),
             audio: AudioMode::System,
+            show_settings: false,
             busy: false,
-            message: None,
+            error: None,
             rx,
             tx,
         }
     }
 
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some((message.into(), Instant::now()));
+    }
+
     fn execute(&mut self, action: Action) {
+        self.error = None;
+
         let rec = match &self.rec {
             Some(rec) => rec.clone(),
             None => {
-                self.message = Some((
-                    "recorder command not found; set REC_BIN or add rec to PATH".into(),
-                    true,
-                    Instant::now(),
-                ));
+                self.set_error("recorder command not found; set REC_BIN or add rec to PATH");
                 return;
             }
         };
@@ -303,7 +338,7 @@ impl App {
         match action {
             Action::StartWebcam => {
                 self.busy = true;
-                spawn_rec(self.tx.clone(), rec, vec!["start".into()], "Webcam started");
+                spawn_rec(self.tx.clone(), rec, vec!["start".into()]);
             }
             Action::StartScreen => {
                 self.busy = true;
@@ -315,12 +350,11 @@ impl App {
                         "start".into(),
                         format!("--audio={}", self.audio.flag()),
                     ],
-                    "Screen recording started",
                 );
             }
             Action::Stop => {
                 self.busy = true;
-                spawn_rec(self.tx.clone(), rec, vec!["stop".into()], "Recording stopped");
+                spawn_rec(self.tx.clone(), rec, vec!["stop".into()]);
             }
             Action::RestartPreview => {
                 self.busy = true;
@@ -328,42 +362,32 @@ impl App {
                     self.tx.clone(),
                     rec,
                     vec!["preview".into(), "start".into()],
-                    "Preview restarted",
                 );
             }
             Action::OpenFolder => {
-                spawn_rec(
-                    self.tx.clone(),
-                    rec,
-                    vec!["open".into()],
-                    "Opened recordings folder",
-                );
+                self.busy = true;
+                spawn_rec(self.tx.clone(), rec, vec!["open".into()]);
             }
             Action::EditConfig => {
                 if self.config_path.is_empty() {
-                    self.message = Some(("Configuration path unavailable".into(), true, Instant::now()));
+                    self.set_error("configuration path unavailable");
                 } else {
-                    spawn_open(
-                        self.tx.clone(),
-                        PathBuf::from(&self.config_path),
-                        "Opened configuration",
-                    );
+                    spawn_open(self.tx.clone(), PathBuf::from(&self.config_path));
                 }
             }
             Action::OpenSession(name) => {
                 if self.output_dir.is_empty() {
-                    self.message = Some(("Recordings directory unavailable".into(), true, Instant::now()));
+                    self.set_error("recordings directory unavailable");
                 } else {
                     spawn_open(
                         self.tx.clone(),
                         Path::new(&self.output_dir).join(name),
-                        "Opened session",
                     );
                 }
             }
             Action::Finalize(name) => {
                 if self.output_dir.is_empty() {
-                    self.message = Some(("Recordings directory unavailable".into(), true, Instant::now()));
+                    self.set_error("recordings directory unavailable");
                 } else {
                     self.busy = true;
                     spawn_rec(
@@ -376,7 +400,6 @@ impl App {
                                 .to_string_lossy()
                                 .to_string(),
                         ],
-                        "Session finalized",
                     );
                 }
             }
@@ -395,13 +418,10 @@ impl App {
                     self.output_dir = output_dir.trim().to_string();
                     self.config_path = config_path.trim().to_string();
                 }
-                Msg::Done(text) => {
-                    self.busy = false;
-                    self.message = Some((text, false, Instant::now()));
-                }
+                Msg::Done => self.busy = false,
                 Msg::Error(text) => {
                     self.busy = false;
-                    self.message = Some((text, true, Instant::now()));
+                    self.set_error(text);
                 }
             }
         }
@@ -420,23 +440,14 @@ impl eframe::App for App {
         let output_dir = self.output_dir.clone();
         let busy = self.busy;
         let mut audio = self.audio;
+        let mut show_settings = self.show_settings;
         let mut action: Option<Action> = None;
 
         egui::CentralPanel::default().show(root_ui, |ui| {
-            ui.heading("Recorder");
-            ui.label(
-                egui::RichText::new("Super+F9 webcam  ·  Super+F10 screen")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(10.0);
-
             if self.rec.is_none() {
-                ui.label(
-                    egui::RichText::new(
-                        "recorder command not found.\nSet REC_BIN or add rec to PATH.",
-                    )
-                    .color(RED),
+                ui.colored_label(
+                    RED,
+                    "recorder command not found.\nSet REC_BIN or add rec to PATH.",
                 );
                 return;
             }
@@ -445,221 +456,207 @@ impl eframe::App for App {
                 Mode::Idle => ("Idle", GREY),
                 Mode::Webcam => ("Recording webcam", GREEN),
                 Mode::Screen => ("Recording screen", BLUE),
-                Mode::Stale => ("Stale session", ORANGE),
+                Mode::Stale => ("Interrupted", ORANGE),
             };
 
             ui.horizontal(|ui| {
+                status_dot(ui, mode_color);
                 ui.label(
                     egui::RichText::new(mode_label)
-                        .size(20.0)
+                        .size(16.0)
                         .strong()
                         .color(mode_color),
                 );
+
+                if matches!(status.mode, Mode::Webcam | Mode::Screen)
+                    && !status.elapsed.is_empty()
+                {
+                    ui.label(egui::RichText::new(&status.elapsed).monospace().weak());
+                }
+
                 if busy {
                     ui.spinner();
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(show_settings, "Settings")
+                        .clicked()
+                    {
+                        show_settings = !show_settings;
+                    }
+                    if ui.button("Folder").clicked() {
+                        action = Some(Action::OpenFolder);
+                    }
+                });
             });
-            ui.add_space(8.0);
 
-            match status.mode {
-                Mode::Idle | Mode::Stale => {
+            if show_settings {
+                ui.add_space(10.0);
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Screen audio").small().weak());
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(
-                                    egui::RichText::new("Start webcam").size(16.0),
-                                )
-                                .min_size(egui::vec2(185.0, 44.0)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::StartWebcam);
-                        }
-
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(
-                                    egui::RichText::new("Start screen").size(16.0),
-                                )
-                                .min_size(egui::vec2(185.0, 44.0)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::StartScreen);
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Screen audio:");
                         ui.radio_value(&mut audio, AudioMode::System, "System");
                         ui.radio_value(&mut audio, AudioMode::Mic, "Mic");
                         ui.radio_value(&mut audio, AudioMode::Both, "Both");
                         ui.radio_value(&mut audio, AudioMode::None, "None");
                     });
-
-                    if status.mode == Mode::Stale {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("The recorder state is stale; stop to finalize.")
-                                .color(ORANGE),
-                        );
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new("Stop and finalize")
-                                    .min_size(egui::vec2(185.0, 36.0)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::Stop);
+                    ui.separator();
+                    if ui.button("Edit configuration").clicked() {
+                        action = Some(Action::EditConfig);
+                    }
+                    if matches!(status.mode, Mode::Screen) && !status.preview_running() {
+                        if ui.button("Restart preview").clicked() {
+                            action = Some(Action::RestartPreview);
                         }
                     }
-                }
-                Mode::Webcam | Mode::Screen => {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(
-                                    egui::RichText::new("Stop").size(18.0).color(RED),
-                                )
-                                .min_size(egui::vec2(185.0, 44.0)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::Stop);
-                        }
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Super+F9 webcam  ·  Super+F10 screen")
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
 
-                        if status.mode == Mode::Screen && !status.preview_running() {
+            ui.add_space(14.0);
+
+            match status.mode {
+                Mode::Idle | Mode::Stale => {
+                    if status.mode == Mode::Stale {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            let width = ui.available_width();
                             if ui
-                                .add_enabled(
-                                    !busy,
-                                    egui::Button::new("Restart preview")
-                                        .min_size(egui::vec2(160.0, 44.0)),
+                                .add_sized(
+                                    [width, 46.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Recover").size(16.0),
+                                    ),
                                 )
                                 .clicked()
                             {
-                                action = Some(Action::RestartPreview);
+                                action = Some(Action::Stop);
                             }
+                        });
+                    } else {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            let width = ui.available_width();
+                            if ui
+                                .add_sized(
+                                    [width, 48.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Record webcam").size(16.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                action = Some(Action::StartWebcam);
+                            }
+                            ui.add_space(8.0);
+                            if ui
+                                .add_sized(
+                                    [width, 48.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Record screen").size(16.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                action = Some(Action::StartScreen);
+                            }
+                        });
+                    }
+                }
+                Mode::Webcam | Mode::Screen => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        let width = ui.available_width();
+                        if ui
+                            .add_sized(
+                                [width, 48.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Stop").size(18.0).color(RED),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            action = Some(Action::Stop);
                         }
                     });
                 }
             }
 
-            if status.mode != Mode::Idle {
-                ui.add_space(10.0);
-                egui::Grid::new("status_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        if !status.session.is_empty() {
-                            ui.label("Session");
-                            ui.label(egui::RichText::new(&status.session).monospace().small());
-                            ui.end_row();
-                        }
-                        if !status.elapsed.is_empty() {
-                            ui.label("Elapsed");
-                            ui.label(&status.elapsed);
-                            ui.end_row();
-                        }
-                        if !status.chunks.is_empty() {
-                            ui.label("Chunks");
-                            ui.label(&status.chunks);
-                            ui.end_row();
-                        }
-                        if !status.free.is_empty() {
-                            ui.label("Free space");
-                            ui.label(&status.free);
-                            ui.end_row();
-                        }
-                        if !status.audio.is_empty() {
-                            ui.label("Audio");
-                            ui.label(&status.audio);
-                            ui.end_row();
-                        }
-                        if !status.preview.is_empty() {
-                            ui.label("Preview");
-                            ui.label(&status.preview);
-                            ui.end_row();
-                        }
-                    });
+            if let Some((text, when)) = &self.error {
+                if when.elapsed() < Duration::from_secs(8) {
+                    ui.add_space(8.0);
+                    ui.colored_label(RED, text);
+                }
             }
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Open recordings").clicked() {
-                    action = Some(Action::OpenFolder);
-                }
-                if ui.button("Edit configuration").clicked() {
-                    action = Some(Action::EditConfig);
-                }
-            });
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("Recent").strong());
+            ui.add_space(4.0);
 
-            ui.add_space(8.0);
-            ui.heading("Recent recordings");
+            let list_height = ui.available_height().max(80.0);
             egui::ScrollArea::vertical()
-                .max_height(190.0)
+                .max_height(list_height)
                 .show(ui, |ui| {
                     if sessions.is_empty() {
-                        ui.label(egui::RichText::new("No recordings yet.").weak());
+                        ui.label(egui::RichText::new("No recordings").weak());
                     }
 
                     for session in &sessions {
-                        ui.add_space(2.0);
+                        if !status.session.is_empty()
+                            && status.session.ends_with(&session.name)
+                        {
+                            continue;
+                        }
+
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(&session.name).monospace().size(13.0),
-                            );
-                            let color = if session.status == "finalized" {
-                                GREEN
-                            } else {
-                                ORANGE
-                            };
-                            ui.label(egui::RichText::new(&session.status).color(color).small());
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&session.duration).small().weak());
-                            ui.label(egui::RichText::new(&session.size).small().weak());
+                                egui::RichText::new(session_label(&session.name))
+                                    .monospace()
+                                    .strong(),
+                            )
+                            .on_hover_text(&session.name);
 
-                            if !output_dir.is_empty() && ui.small_button("Open").clicked() {
-                                action = Some(Action::OpenSession(session.name.clone()));
-                            }
-                            if session.status.contains("chunks")
-                                && ui.small_button("Finalize").clicked()
-                            {
-                                action = Some(Action::Finalize(session.name.clone()));
-                            }
+                            ui.label(
+                                egui::RichText::new(session_mode(&session.name))
+                                    .small()
+                                    .weak(),
+                            );
+
+                            let duration = if session.duration == "-" {
+                                "—"
+                            } else {
+                                session.duration.as_str()
+                            };
+                            ui.label(egui::RichText::new(duration).small().weak());
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if is_recoverable(&session.status) {
+                                        if ui.small_button("Recover").clicked() {
+                                            action =
+                                                Some(Action::Finalize(session.name.clone()));
+                                        }
+                                    } else if !output_dir.is_empty()
+                                        && ui.small_button("Open").clicked()
+                                    {
+                                        action =
+                                            Some(Action::OpenSession(session.name.clone()));
+                                    }
+                                },
+                            );
                         });
-                        ui.separator();
+                        ui.add_space(2.0);
                     }
                 });
-
-            if let Some((text, is_error, when)) = &self.message {
-                if when.elapsed() < Duration::from_secs(10) {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(text)
-                            .color(if *is_error { RED } else { GREEN })
-                            .small(),
-                    );
-                }
-            }
-
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("The preview is a separate window controlled by the recorder.")
-                    .small()
-                    .weak(),
-            );
         });
 
         self.audio = audio;
+        self.show_settings = show_settings;
         if let Some(action) = action {
-            self.message = None;
             self.execute(action);
         }
     }
@@ -668,8 +665,9 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 650.0])
-            .with_min_inner_size([380.0, 500.0]),
+            .with_inner_size([400.0, 520.0])
+            .with_min_inner_size([340.0, 420.0])
+            .with_title("Recorder"),
         ..Default::default()
     };
 
@@ -691,8 +689,6 @@ mod tests {
         assert_eq!(status.mode, Mode::Screen);
         assert_eq!(status.session, "/tmp/screen-1");
         assert_eq!(status.elapsed, "00:01:02");
-        assert_eq!(status.chunks, "3 (4.5M)");
-        assert_eq!(status.audio, "both");
         assert!(status.preview_running());
     }
 
@@ -700,7 +696,7 @@ mod tests {
     fn parses_idle_status() {
         let status = parse_status("idle\n");
         assert_eq!(status.mode, Mode::Idle);
-        assert!(status.session.is_empty());
+        assert!(status.elapsed.is_empty());
     }
 
     #[test]
@@ -709,7 +705,24 @@ mod tests {
         let sessions = parse_sessions(raw);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "webcam-2026-01-01_10-00-00");
+        assert_eq!(sessions[0].duration, "00:00:12");
         assert_eq!(sessions[0].status, "finalized");
         assert_eq!(sessions[1].status, "chunks only");
+    }
+
+    #[test]
+    fn formats_session_labels() {
+        assert_eq!(
+            session_label("webcam-2026-10-25_18-53-18"),
+            "10-25 18:53"
+        );
+        assert_eq!(
+            session_label("screen-2026-10-25_17-27-28"),
+            "10-25 17:27"
+        );
+        assert_eq!(session_label("2026-10-25_17-21-51"), "10-25 17:21");
+        assert_eq!(session_mode("webcam-2026-10-25_18-53-18"), "webcam");
+        assert_eq!(session_mode("screen-2026-10-25_17-27-28"), "screen");
+        assert_eq!(session_mode("2026-10-25_17-21-51"), "session");
     }
 }
