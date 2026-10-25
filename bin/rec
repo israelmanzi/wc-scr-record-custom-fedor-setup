@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# rec — webcam and screen recorder control
+#
+#   rec start                 webcam-only AV1 + floating preview (Super+F9)
+#   rec stop                  stop and finalize the active recording
+#   rec toggle                toggle webcam-only recording
+#   rec screen start [--audio=system|mic|both|none]
+#   rec screen stop|toggle|status
+#   rec preview start|stop|status
+#   rec status                show the current state
+#   rec list                  list recent sessions
+#   rec open                  open the recordings folder
+#   rec finalize <session-dir> finalize by hand (crash recovery)
+#
+# Configuration lives in ../rec.env. Recordings land in $OUTPUT_DIR.
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$SELF_DIR")"
+CONFIG="$ROOT/rec.env"
+# shellcheck source=/dev/null
+source "$CONFIG"
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
+mkdir -p "$STATE_DIR" "$OUTPUT_DIR"
+
+# So notifications work when launched from a hotkey or a detached context.
+export DISPLAY="${DISPLAY:-:0.0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+RUNFLAG="$STATE_DIR/running"
+FFPID="$STATE_DIR/ffmpeg.pid"
+SUPPID="$STATE_DIR/supervisor.pid"
+SESSION_FILE="$STATE_DIR/session"
+STARTED_FILE="$STATE_DIR/started_at"
+MODE_FILE="$STATE_DIR/mode"
+AUDIO_FILE="$STATE_DIR/audio_mode"
+PREVIEW_PID="$STATE_DIR/preview.pid"
+INTERNAL_PREVIEW_PID="$STATE_DIR/internal_preview.pid"
+INTERNAL_PREVIEW_FIFO="$STATE_DIR/internal_preview.fifo"
+INHIBIT_PID_FILE="$STATE_DIR/inhibit.pid"
+CONTROL_FIFO="$STATE_DIR/control.fifo"
+
+kill_stale_inhibitor() {
+  [ -f "$INHIBIT_PID_FILE" ] || return 0
+  local ipid
+  ipid="$(cat "$INHIBIT_PID_FILE" 2>/dev/null)"
+  if [ -n "$ipid" ] && kill -0 "$ipid" 2>/dev/null; then
+    if ps -p "$ipid" -o args= 2>/dev/null | grep -q "systemd-inhibit.*Recording in progress"; then
+      pkill -TERM -P "$ipid" 2>/dev/null || true
+      kill -TERM "$ipid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$INHIBIT_PID_FILE"
+}
+
+PREVIEW_X="${PREVIEW_X:-0}"
+PREVIEW_Y="${PREVIEW_Y:-0}"
+LOCK_FILE="$STATE_DIR/lock"
+
+acquire_lock() {
+  # Serialize start/stop/preview operations so two hotkeys can't race.
+  local wait="${1:-5}"
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$LOCK_FILE" || return 1
+  flock -w "$wait" 9 || return 1
+}
+
+notify() {
+  # Never use critical urgency: xfce4-notifyd pins critical notifications to the
+  # screen until dismissed. Transient + normal + an explicit timeout always
+  # expires, and the replace-id hint stops messages from stacking up.
+  # Short single-line notifications, no icon.
+  local msg="$1" timeout="${2:-2500}"
+  local idfile="$STATE_DIR/last_notification_id" id=""
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local args=(-a "Webcam Recorder" -u normal -t "$timeout" -e -p)
+  if [ -s "$idfile" ]; then
+    id="$(cat "$idfile" 2>/dev/null)"
+    [ -n "$id" ] && args+=(-r "$id")
+  fi
+  id="$(notify-send "${args[@]}" "$msg" 2>/dev/null)" || true
+  [ -n "$id" ] && printf '%s\n' "$id" >"$idfile"
+}
+
+free_gb() { df -BG --output=avail "$OUTPUT_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9'; }
+
+secs_to_hms() {
+  awk -v s="${1:-0}" 'BEGIN { printf "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60 }'
+}
+
+camera_ok() {
+  # v4l2-ctl alone succeeds while another process is streaming; fuser catches
+  # a device that is already open.
+  if command -v fuser >/dev/null 2>&1 && fuser -s "$DEVICE" 2>/dev/null; then
+    return 1
+  fi
+  timeout 3 v4l2-ctl -d "$DEVICE" --get-fmt-video >/dev/null 2>&1
+}
+
+state_mode() { [ -f "$MODE_FILE" ] && cat "$MODE_FILE" 2>/dev/null || true; }
+
+screen_geometry() {
+  xrandr --current 2>/dev/null | awk '
+    / connected/ {
+      for (i = 1; i <= NF; i++)
+        if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) { print $i; exit }
+    }'
+}
+
+compute_screen() {
+  local geom rest
+  if [ "${SCREEN_SIZE:-auto}" = "auto" ]; then
+    geom="$(screen_geometry)"
+    [ -n "$geom" ] || geom="1920x1080+0+0"
+    SCREEN_SIZE="${geom%%+*}"
+    rest="${geom#*+}"
+    SCREEN_X="${rest%%+*}"
+    SCREEN_Y="${rest##*+}"
+  else
+    SCREEN_X="${SCREEN_X:-0}"
+    SCREEN_Y="${SCREEN_Y:-0}"
+  fi
+  PREVIEW_X=$(( SCREEN_X + ${SCREEN_SIZE%x*} - ${PREVIEW_WIDTH:-320} - ${PREVIEW_MARGIN:-20} ))
+  PREVIEW_Y=$(( SCREEN_Y + ${PREVIEW_MARGIN:-20} ))
+  export SCREEN_SIZE SCREEN_X SCREEN_Y PREVIEW_X PREVIEW_Y
+}
+
+place_window() {
+  command -v xdotool >/dev/null 2>&1 || return 0
+  local i wid
+  for i in $(seq 1 40); do
+    wid="$(xdotool search --name "${PREVIEW_TITLE:-Webcam Preview}" 2>/dev/null | head -n1)"
+    [ -n "$wid" ] && break
+    sleep 0.1
+  done
+  [ -n "$wid" ] || return 0
+  xdotool windowsize "$wid" "${PREVIEW_WIDTH:-320}" "${PREVIEW_HEIGHT:-180}" 2>/dev/null || true
+  xdotool windowmove "$wid" "$PREVIEW_X" "$PREVIEW_Y" 2>/dev/null || true
+  xdotool windowstate --add ABOVE "$wid" 2>/dev/null || true
+  xdotool windowstate --add STICKY "$wid" 2>/dev/null || true
+  xprop -id "$wid" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 4294967295 2>/dev/null || true
+}
+
+preview_running() {
+  [ -f "$PREVIEW_PID" ] || return 1
+  local pid
+  pid="$(cat "$PREVIEW_PID" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+stop_preview() {
+  local pid i
+  if preview_running; then
+    pid="$(cat "$PREVIEW_PID")"
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PREVIEW_PID"
+}
+
+stop_internal_preview() {
+  local pid i
+  if [ -f "$INTERNAL_PREVIEW_PID" ]; then
+    pid="$(cat "$INTERNAL_PREVIEW_PID" 2>/dev/null)"
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for i in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$INTERNAL_PREVIEW_PID"
+  fi
+  rm -f "$INTERNAL_PREVIEW_FIFO"
+}
+
+start_preview() {
+  if preview_running; then
+    place_window
+    return 0
+  fi
+  rm -f "$PREVIEW_PID"
+  compute_screen
+  local prev="" i
+  command -v xdotool >/dev/null 2>&1 && prev="$(xdotool getactivewindow 2>/dev/null)"
+  setsid --fork "$SELF_DIR/rec-preview" </dev/null >>"$STATE_DIR/preview.log" 2>&1 9>&-
+  for i in $(seq 1 50); do
+    preview_running && break
+    sleep 0.1
+  done
+  if ! preview_running; then
+    notify "Camera unavailable." 5000
+    return 1
+  fi
+  # ffplay can exit just after starting if the camera is busy; verify it stayed up.
+  sleep 0.5
+  if ! preview_running; then
+    notify "Camera unavailable." 5000
+    return 1
+  fi
+  place_window
+  if [ -n "$prev" ]; then
+    xdotool windowfocus "$prev" 2>/dev/null || true
+  fi
+  return 0
+}
+
+start_session() {
+  local mode="$1" audio="${2:-}"
+  acquire_lock 3 || { notify "Busy — try again."; return 1; }
+  if [ -f "$RUNFLAG" ]; then
+    printf 'already recording: %s (%s)\n' "$(cat "$SESSION_FILE" 2>/dev/null)" "$(state_mode)"
+    notify "Already recording."
+    return 1
+  fi
+
+  local avail
+  avail="$(free_gb)"
+  if [ -n "$avail" ] && (( avail < MIN_FREE_GB + 2 )); then
+    printf 'not enough free space: %s GB\n' "$avail" >&2
+    notify "Only ${avail} GB free." 5000
+    return 1
+  fi
+
+  # Clean up anything left by a previous/crashed session before opening the
+  # camera or starting the screen recorder.
+  stop_internal_preview
+  kill_stale_inhibitor
+
+  case "$mode" in
+    webcam)
+      # A stray screen preview would hold the camera; release it first.
+      stop_preview
+      if ! camera_ok; then
+        printf 'camera %s unavailable (in use or unplugged)\n' "$DEVICE" >&2
+        notify "Camera unavailable." 5000
+        return 1
+      fi
+      audio="mic"
+      ;;
+    screen)
+      audio="${audio:-$SCREEN_AUDIO}"
+      case "$audio" in
+        system|mic|both|none) ;;
+        *) printf 'invalid audio mode: %s\n' "$audio" >&2; return 1 ;;
+      esac
+      ;;
+    *)
+      printf 'unknown mode: %s\n' "$mode" >&2
+      return 1
+      ;;
+  esac
+
+  compute_screen
+
+  if [ "$mode" = "screen" ] && [ "${AUDIO_MONITOR:-auto}" = "auto" ]; then
+    AUDIO_MONITOR="$(pactl get-default-sink 2>/dev/null).monitor"
+    export AUDIO_MONITOR
+  fi
+
+  local session codec_label tag base n vdesc pixdesc
+  if [ "$mode" = "webcam" ]; then
+    case "$VIDEO_CODEC" in
+      libsvtav1)   codec_label="AV1 / SVT-AV1"; vdesc="CRF $CRF, preset $PRESET, low-delay" ;;
+      libx264)     codec_label="H.264 / x264"; vdesc="CRF $CRF, preset $PRESET" ;;
+      hevc_nvenc)  codec_label="HEVC / NVENC"; vdesc="CQ ${NVENC_CQ:-30}, preset ${NVENC_PRESET:-p5}" ;;
+      h264_nvenc)  codec_label="H.264 / NVENC"; vdesc="CQ ${NVENC_CQ:-30}, preset ${NVENC_PRESET:-p5}" ;;
+      *)           codec_label="$VIDEO_CODEC"; vdesc="codec $VIDEO_CODEC" ;;
+    esac
+  else
+    case "$SCREEN_CODEC" in
+      hevc_nvenc) codec_label="HEVC / NVENC" ;;
+      h264_nvenc) codec_label="H.264 / NVENC" ;;
+      libx264)    codec_label="H.264 / x264" ;;
+      *)          codec_label="$SCREEN_CODEC" ;;
+    esac
+  fi
+
+  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ]; then
+    case "$VIDEO_CODEC" in
+      hevc_nvenc|h264_nvenc) vdesc+=", GPU decode" ;;
+    esac
+  fi
+
+  pixdesc="yuv420p/bt709"
+  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ]; then
+    case "$VIDEO_CODEC" in
+      hevc_nvenc|h264_nvenc) pixdesc="yuvj420p/full-range BT.470BG" ;;
+    esac
+  fi
+
+  [ "$mode" = "screen" ] && tag="screen" || tag="webcam"
+  base="$OUTPUT_DIR/${tag}-$(date '+%Y-%m-%d_%H-%M-%S')"
+  session="$base"
+  n=2
+  while [ -e "$session" ]; do
+    session="${base}_${n}"
+    n=$((n + 1))
+  done
+  mkdir -p "$session"
+
+  # Start the preview before the screen recorder, so the PiP is present from
+  # frame zero. Webcam mode embeds its preview in the recorder process itself.
+  if [ "$mode" = "screen" ]; then
+    if ! start_preview; then
+      stop_preview
+      rmdir "$session" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$session" > "$SESSION_FILE"
+  date +%s > "$STARTED_FILE"
+  printf '%s\n' "$mode" > "$MODE_FILE"
+  printf '%s\n' "$audio" > "$AUDIO_FILE"
+
+  {
+    echo "session:    $session"
+    echo "mode:       $mode"
+    echo "started:    $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    if [ "$mode" = "webcam" ]; then
+      echo "camera:     $DEVICE ($INPUT_FORMAT ${VIDEO_SIZE} @ ${FRAMERATE}fps)"
+      echo "video:      $codec_label $vdesc, 2s keyframes, $pixdesc"
+      echo "audio:      $AUDIO_SOURCE, AAC $AUDIO_BITRATE mono 48kHz"
+      echo "preview:    ${PREVIEW_WIDTH}x${PREVIEW_HEIGHT} ffplay window (not recorded)"
+      if [ "${MIC_GAIN:-0}" = "1" ]; then
+        echo "mic gain:   ALSA Capture=${MIC_CAPTURE:-112}, MicBoost=${MIC_BOOST:-0} (enforced at start)"
+      fi
+    else
+      echo "screen:     $SCREEN_SIZE @ ${SCREEN_FRAMERATE}fps (x11grab)"
+      echo "video:      $codec_label CQ $SCREEN_CQ, 2s keyframes, yuv420p/bt709"
+      echo "audio:      $audio (system: $AUDIO_MONITOR / mic: $AUDIO_SOURCE)"
+      echo "preview:    ${PREVIEW_WIDTH}x${PREVIEW_HEIGHT} at +${PREVIEW_X},+${PREVIEW_Y} (recorded as PiP)"
+      if [ "$audio" = "mic" ] || [ "$audio" = "both" ]; then
+        echo "mic gain:   ALSA Capture=${MIC_CAPTURE:-112}, MicBoost=${MIC_BOOST:-0} (enforced at start)"
+      fi
+    fi
+    echo "chunks:     ${SEGMENT_SECONDS}s MKV, remuxed losslessly to MP4 on stop"
+    echo "recover:    $SELF_DIR/rec-finalize \"$session\""
+  } > "$session/session-info.txt"
+
+  rm -f "$SUPPID" "$FFPID"
+  rm -f "$CONTROL_FIFO"
+  touch "$RUNFLAG"
+
+  export MODE="$mode" AUDIO_MODE="$audio"
+  if [ "$mode" = "webcam" ]; then
+    export INTERNAL_PREVIEW=1
+  else
+    export INTERNAL_PREVIEW=0
+  fi
+  export SCREEN_SIZE SCREEN_X SCREEN_Y PREVIEW_X PREVIEW_Y
+
+  setsid --fork "$SELF_DIR/rec-supervisor" "$session" \
+    </dev/null >>"$session/supervisor.log" 2>&1 9>&-
+
+  local i failed=0
+  for i in $(seq 1 40); do [ -f "$SUPPID" ] && break; sleep 0.1; done
+  for i in $(seq 1 40); do [ -f "$FFPID" ] && break; sleep 0.1; done
+
+  if [ ! -f "$FFPID" ]; then
+    failed=1
+  else
+    # Give ffmpeg a moment to open the camera; a busy device exits immediately.
+    sleep 0.5
+    kill -0 "$(cat "$FFPID" 2>/dev/null)" 2>/dev/null || failed=1
+  fi
+
+  if [ "$failed" -eq 1 ]; then
+    rm -f "$RUNFLAG"
+    if [ -f "$SUPPID" ]; then kill -TERM "$(cat "$SUPPID")" 2>/dev/null || true; fi
+    if [ -f "$FFPID" ]; then kill -TERM "$(cat "$FFPID")" 2>/dev/null || true; fi
+    stop_internal_preview
+    [ "$mode" = "screen" ] && stop_preview
+    rm -f "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO"
+    printf 'recording failed to start; see %s\n' "$session/recorder.log" >&2
+    notify "Start failed — see log." 5000
+    return 1
+  fi
+
+  # Webcam mode starts its preview inside the supervisor; pin it above.
+  if [ "$mode" = "webcam" ]; then
+    place_window
+    notify "Webcam recording started"
+  else
+    notify "Screen recording started"
+  fi
+  printf '%s\n' "$session"
+}
+
+stop_session() {
+  local mode="" session="" active=0 out="" size=""
+  acquire_lock 10 || { notify "Stop timed out."; return 1; }
+  [ -f "$MODE_FILE" ] && mode="$(cat "$MODE_FILE")"
+  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
+  [ -f "$RUNFLAG" ] && active=1
+
+  if [ "$active" -eq 0 ] && { [ -z "$session" ] || [ ! -d "$session" ]; } && ! preview_running; then
+    printf 'not recording\n'
+    notify "Not recording."
+    return 0
+  fi
+
+  rm -f "$RUNFLAG"
+
+  # Graceful stop: ffmpeg reads commands from the control FIFO; 'q' flushes the
+  # audio/video encoders instead of discarding the buffered audio tail.
+  if [ -p "$CONTROL_FIFO" ]; then
+    timeout 1 sh -c 'printf "q\n" > "$1"' _ "$CONTROL_FIFO" >/dev/null 2>&1 || true
+    local qi
+    for qi in $(seq 1 20); do
+      [ -f "$FFPID" ] || break
+      sleep 0.1
+    done
+  fi
+  if [ -f "$FFPID" ]; then
+    kill -INT "$(cat "$FFPID")" 2>/dev/null || true
+  fi
+
+  local spid=""
+  [ -f "$SUPPID" ] && spid="$(cat "$SUPPID")"
+  if [ -n "$spid" ]; then
+    local i
+    for i in $(seq 1 60); do
+      kill -0 "$spid" 2>/dev/null || break
+      sleep 0.25
+    done
+    if kill -0 "$spid" 2>/dev/null; then
+      kill -TERM "$spid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$spid" 2>/dev/null || true
+    fi
+  fi
+
+  if [ -f "$FFPID" ]; then
+    local fpid
+    fpid="$(cat "$FFPID")"
+    kill -TERM "$fpid" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL "$fpid" 2>/dev/null || true
+  fi
+
+  # Last resort: the supervisor is a session leader; clean up survivors in its
+  # process group (watchdog subshell, inhibitor, preview) after a SIGKILL.
+  if [ -n "$spid" ] && ps -eo pgid,args 2>/dev/null \
+      | awk -v g="$spid" '$1==g && ($0 ~ /rec-supervisor/ || $0 ~ /ffmpeg/) {found=1} END{exit !found}'; then
+    kill -TERM -- "-$spid" 2>/dev/null || true
+    sleep 0.3
+    kill -KILL -- "-$spid" 2>/dev/null || true
+  fi
+
+  # Stop the external preview after the recorder, so it stays until the end.
+  stop_preview
+  stop_internal_preview
+  kill_stale_inhibitor
+
+  if [ -n "$session" ] && [ -d "$session" ]; then
+    if out="$("$SELF_DIR/rec-finalize" "$session" 2>>"$session/finalize.log")"; then
+      notify "Saved: $(basename "$session")"
+      printf '%s\n' "$out"
+    else
+      printf 'finalize failed; chunks kept in %s\n' "$session" >&2
+      notify "Finalize failed: $(basename "$session")" 5000
+    fi
+  else
+    notify "Recording stopped."
+  fi
+
+  rm -f "$RUNFLAG" "$FFPID" "$SUPPID" "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO"
+  return 0
+}
+
+show_status() {
+  local session="" started elapsed parts size mode
+  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
+  mode="$(state_mode)"
+  compute_screen
+
+  if [ -f "$RUNFLAG" ]; then
+    started="$(cat "$STARTED_FILE" 2>/dev/null || echo 0)"
+    elapsed=$(( $(date +%s) - started ))
+    parts="$(find "$session" -maxdepth 1 -name 'part-*.mkv' 2>/dev/null | wc -l)"
+    size="$(du -sh "$session" 2>/dev/null | cut -f1)"
+    printf 'RECORDING (%s)\n' "${mode:-webcam}"
+    printf '  session : %s\n' "$session"
+    printf '  elapsed : %s\n' "$(secs_to_hms "$elapsed")"
+    printf '  chunks  : %s (%s)\n' "$parts" "${size:-0}"
+    printf '  free    : %s GB\n' "$(free_gb)"
+    if [ "$mode" = "screen" ]; then
+      printf '  audio   : %s\n' "$(cat "$AUDIO_FILE" 2>/dev/null || echo "$SCREEN_AUDIO")"
+      if preview_running; then
+        printf '  preview : running (%sx%s PiP at +%s,+%s)\n' \
+          "${PREVIEW_WIDTH}" "${PREVIEW_HEIGHT}" "$PREVIEW_X" "$PREVIEW_Y"
+      else
+        printf '  preview : NOT running (screen recording continues)\n'
+      fi
+    else
+      printf '  audio   : mic\n'
+      if [ -f "$INTERNAL_PREVIEW_PID" ] && kill -0 "$(cat "$INTERNAL_PREVIEW_PID" 2>/dev/null)" 2>/dev/null; then
+        printf '  preview : running (internal ffplay)\n'
+      else
+        printf '  preview : NOT running\n'
+      fi
+    fi
+  elif [ -n "$session" ] && [ -d "$session" ]; then
+    printf 'STALE — recorder died; run "rec stop" to finalize\n'
+    printf '  session : %s\n' "$session"
+  else
+    printf 'idle\n'
+  fi
+}
+
+list_sessions() {
+  local d name mp4 dur size
+  shopt -s nullglob
+  local dirs=("$OUTPUT_DIR"/*/)
+  if [ "${#dirs[@]}" -eq 0 ]; then
+    printf 'no sessions yet\n'
+    return 0
+  fi
+  printf '%-28s %10s %8s  %s\n' "SESSION" "DURATION" "SIZE" "STATUS"
+  for d in $(printf '%s\n' "${dirs[@]}" | sort -r); do
+    name="$(basename "$d")"
+    size="$(du -sh "$d" 2>/dev/null | cut -f1)"
+    mp4="$(find "$d" -maxdepth 1 -type f -name '*.mp4' | head -n1)"
+    if [ -n "$mp4" ]; then
+      dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$mp4" 2>/dev/null)"
+      printf '%-28s %10s %8s  %s\n' "$name" "$(secs_to_hms "${dur:-0}")" "$size" "finalized"
+    else
+      printf '%-28s %10s %8s  %s\n' "$name" "-" "$size" "chunks only"
+    fi
+  done
+}
+
+case "${1:-}" in
+  start)    start_session webcam ;;
+  stop)     stop_session ;;
+  toggle)
+    if [ -f "$RUNFLAG" ]; then
+      case "$(state_mode)" in
+        webcam) stop_session ;;
+        screen) notify "Screen active — Super+F10 to stop." ;;
+        *)      notify "Recording active — use rec stop." ;;
+      esac
+    else
+      start_session webcam
+    fi
+    ;;
+  screen)
+    action="${2:-toggle}"
+    case "$action" in
+      start)
+        audio=""
+        shift 2
+        for arg in "$@"; do
+          case "$arg" in
+            --audio=*) audio="${arg#--audio=}" ;;
+            *) printf 'unknown option: %s\n' "$arg" >&2; exit 1 ;;
+          esac
+        done
+        start_session screen "$audio"
+        ;;
+      stop)   stop_session ;;
+      toggle)
+        if [ -f "$RUNFLAG" ]; then
+          case "$(state_mode)" in
+            screen) stop_session ;;
+            webcam) notify "Webcam active — Super+F9 to stop." ;;
+            *)      notify "Recording active — use rec stop." ;;
+          esac
+        else
+          start_session screen
+        fi
+        ;;
+      status) show_status ;;
+      *)
+        printf 'usage: rec screen [start [--audio=system|mic|both|none]|stop|toggle|status]\n' >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  preview)
+    case "${2:-status}" in
+      start)
+        acquire_lock 3 || { notify "Busy — try again."; exit 1; }
+        if [ -f "$RUNFLAG" ] && [ "$(state_mode)" = "webcam" ]; then
+          notify "Stop the webcam first."
+          exit 1
+        fi
+        start_preview
+        ;;
+      stop)
+        acquire_lock 5 || { notify "Busy — try again."; exit 1; }
+        stop_preview
+        ;;
+      status) preview_running && echo "preview running" || echo "preview stopped" ;;
+      *)      printf 'usage: rec preview [start|stop|status]\n' >&2; exit 1 ;;
+    esac
+    ;;
+  status)   show_status ;;
+  list)     list_sessions ;;
+  open)     xdg-open "$OUTPUT_DIR" >/dev/null 2>&1 & ;;
+  finalize)
+    [ $# -ge 2 ] || { echo "usage: rec finalize <session-dir>" >&2; exit 1; }
+    "$SELF_DIR/rec-finalize" "$2"
+    ;;
+  ""|help|-h|--help)
+    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "unknown command: $1 (try: rec help)" >&2
+    exit 1
+    ;;
+esac

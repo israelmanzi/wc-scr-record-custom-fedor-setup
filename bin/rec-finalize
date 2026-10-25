@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Losslessly joins a session's MKV chunks into one upload-ready MP4.
+# No re-encode: the video and audio streams are copied.
+#
+#   rec-finalize <session-dir>
+#
+# Prints the MP4 path on success.
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$SELF_DIR")"
+CONFIG="$ROOT/rec.env"
+# shellcheck source=/dev/null
+source "$CONFIG"
+
+session="${1:?usage: rec-finalize <session-dir>}"
+session="$(readlink -f "$session")"
+[ -d "$session" ] || { echo "no such session: $session" >&2; exit 1; }
+
+out="$session/$(basename "$session").mp4"
+list="$session/.concat.txt"
+log="$session/finalize.log"
+
+mapfile -t all_parts < <(
+  find "$session" -maxdepth 1 -type f -name 'part-*.mkv' -printf '%T@ %p\n' \
+    | sort -n | cut -d' ' -f2-
+)
+
+# A chunk killed before its first cluster flush is zero bytes; ignore it.
+parts=()
+for p in "${all_parts[@]}"; do
+  [ -s "$p" ] && parts+=("$p")
+done
+
+if [ "${#parts[@]}" -eq 0 ]; then
+  if [ -f "$out" ]; then
+    printf '%s\n' "$out"
+    exit 0
+  fi
+  echo "no chunks to finalize in $session" >&2
+  exit 1
+fi
+
+: > "$list"
+: > "$log"
+for p in "${parts[@]}"; do
+  printf "file '%s'\n" "$p" >>"$list"
+done
+
+if ! ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i "$list" \
+    -c copy -movflags +faststart "$out" >>"$log" 2>&1; then
+  echo "concat failed; chunks kept. See $log" >&2
+  exit 1
+fi
+
+final_dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null)"
+
+# A chunk cut off by a crash has no container duration; fall back to its last
+# video packet timestamp. Normal chunks answer from metadata in milliseconds.
+part_duration() {
+  local p="$1" d last
+  d="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$p" 2>/dev/null)"
+  case "$d" in
+    ''|N/A) ;;
+    *) printf '%.3f' "$d"; return 0 ;;
+  esac
+  last="$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time \
+    -of csv=p=0 "$p" 2>/dev/null \
+    | grep -E '^[0-9]+(\.[0-9]+)?$' | tail -n1)"
+  printf '%.3f' "${last:-0}"
+}
+
+parts_dur=0
+for p in "${parts[@]}"; do
+  d="$(part_duration "$p")"
+  parts_dur="$(awk -v a="$parts_dur" -v b="$d" 'BEGIN { printf "%.3f", a + b }')"
+done
+
+if ! awk -v a="${final_dur:-0}" -v b="${parts_dur:-0}" \
+    'BEGIN { d = a - b; if (d < 0) d = -d; exit !(b > 0 && d <= (b > 10 ? b * 0.01 : 2.0)) }'; then
+  echo "duration mismatch (chunks ${parts_dur}s, mp4 ${final_dur}s); chunks kept" >&2
+  exit 2
+fi
+
+if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 "$out" 2>/dev/null | grep -q .; then
+  echo "no video stream in $out; chunks kept" >&2
+  exit 2
+fi
+
+if [ "$AUDIO_ENABLED" = "1" ] \
+    && ! ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+      -of csv=p=0 "$out" 2>/dev/null | grep -q .; then
+  echo "warning: no audio stream in $out" >&2
+fi
+
+if [ "${KEEP_PARTS:-0}" != "1" ]; then
+  rm -f -- "${all_parts[@]}" "$list"
+fi
+
+[ -s "$log" ] || rm -f "$log"
+
+printf '%s\n' "$out"

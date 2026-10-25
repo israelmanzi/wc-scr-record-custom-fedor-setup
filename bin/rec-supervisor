@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# Keeps ffmpeg alive for one recording session.
+# Started detached by `rec`; not meant to be run by hand.
+#
+# MODE=webcam : camera -> AV1/MKV + ffplay preview fed by a rawvideo FIFO
+# MODE=screen : x11grab -> HEVC NVENC/MKV; preview is an external ffplay window
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$SELF_DIR")"
+CONFIG="$ROOT/rec.env"
+# shellcheck source=/dev/null
+source "$CONFIG"
+
+MODE="${MODE:-webcam}"
+AUDIO_MODE="${AUDIO_MODE:-}"
+INTERNAL_PREVIEW="${INTERNAL_PREVIEW:-0}"
+SCREEN_SIZE="${SCREEN_SIZE:-1920x1080}"
+SCREEN_X="${SCREEN_X:-0}"
+SCREEN_Y="${SCREEN_Y:-0}"
+PREVIEW_X="${PREVIEW_X:-0}"
+PREVIEW_Y="${PREVIEW_Y:-0}"
+
+case "$MODE" in
+  webcam)
+    case "$VIDEO_CODEC" in
+      libsvtav1|libx264|hevc_nvenc|h264_nvenc) ;;
+      *) echo "unknown VIDEO_CODEC in rec.env: $VIDEO_CODEC" >&2; exit 1 ;;
+    esac
+    ;;
+  screen)
+    case "$SCREEN_CODEC" in
+      hevc_nvenc|h264_nvenc|libx264) ;;
+      *) echo "unknown SCREEN_CODEC in rec.env: $SCREEN_CODEC" >&2; exit 1 ;;
+    esac
+    case "${AUDIO_MODE:-$SCREEN_AUDIO}" in
+      system|mic|both|none) ;;
+      *) echo "unknown AUDIO_MODE: $AUDIO_MODE" >&2; exit 1 ;;
+    esac
+    AUDIO_MODE="${AUDIO_MODE:-$SCREEN_AUDIO}"
+    ;;
+  *)
+    echo "unknown MODE: $MODE" >&2
+    exit 1
+    ;;
+esac
+
+if [ "${AUDIO_MONITOR:-auto}" = "auto" ]; then
+  AUDIO_MONITOR="$(pactl get-default-sink 2>/dev/null).monitor"
+fi
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
+SESSION_DIR="${1:?usage: rec-supervisor <session-dir>}"
+RUNFLAG="$STATE_DIR/running"
+FFPID="$STATE_DIR/ffmpeg.pid"
+SUPPID="$STATE_DIR/supervisor.pid"
+LOG="$SESSION_DIR/recorder.log"
+PREVIEW_FIFO="$STATE_DIR/internal_preview.fifo"
+PREVIEW_PID_FILE="$STATE_DIR/internal_preview.pid"
+CONTROL_FIFO="$STATE_DIR/control.fifo"
+CONTROL_HOLDER_PID=""
+
+mkdir -p "$STATE_DIR"
+echo $$ > "$SUPPID"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+notify() {
+  # See bin/rec: short, transient, normal urgency, no icon.
+  local msg="$1" timeout="${2:-2500}"
+  local idfile="$STATE_DIR/last_notification_id" id=""
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local args=(-a "Webcam Recorder" -u normal -t "$timeout" -e -p)
+  if [ -s "$idfile" ]; then
+    id="$(cat "$idfile" 2>/dev/null)"
+    [ -n "$id" ] && args+=(-r "$id")
+  fi
+  id="$(notify-send "${args[@]}" "$msg" 2>/dev/null)" || true
+  [ -n "$id" ] && printf '%s\n' "$id" >"$idfile"
+}
+
+free_gb() { df -BG --output=avail "$OUTPUT_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9'; }
+
+mic_in_use() {
+  if [ "$MODE" = "screen" ]; then
+    [ "${AUDIO_MODE:-system}" = "mic" ] || [ "${AUDIO_MODE:-system}" = "both" ]
+  else
+    [ "${AUDIO_ENABLED:-1}" = "1" ]
+  fi
+}
+
+apply_mic_gain() {
+  mic_in_use || return 0
+  [ "${MIC_GAIN:-0}" = "1" ] || return 0
+  command -v amixer >/dev/null 2>&1 || return 0
+  amixer -c 0 sset 'Mic Boost' "${MIC_BOOST:-0}" >/dev/null 2>&1 || true
+  amixer -c 0 sset 'Internal Mic Boost' 0 >/dev/null 2>&1 || true
+  amixer -c 0 sset Capture "${MIC_CAPTURE:-112}" >/dev/null 2>&1 || true
+  log "mic gain applied: Capture=${MIC_CAPTURE:-112} MicBoost=${MIC_BOOST:-0}"
+}
+
+place_preview_window() {
+  command -v xdotool >/dev/null 2>&1 || return 0
+  local i wid
+  for i in $(seq 1 40); do
+    wid="$(xdotool search --name "${PREVIEW_TITLE:-Webcam Preview}" 2>/dev/null | head -n1)"
+    [ -n "$wid" ] && break
+    sleep 0.1
+  done
+  [ -n "$wid" ] || return 0
+  xdotool windowsize "$wid" "${PREVIEW_WIDTH:-320}" "${PREVIEW_HEIGHT:-180}" 2>/dev/null || true
+  xdotool windowmove "$wid" "$PREVIEW_X" "$PREVIEW_Y" 2>/dev/null || true
+  xdotool windowstate --add ABOVE "$wid" 2>/dev/null || true
+  xdotool windowstate --add STICKY "$wid" 2>/dev/null || true
+  # Sticky via EWMH: show on every workspace, so the PiP follows you.
+  xprop -id "$wid" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 4294967295 2>/dev/null || true
+}
+
+start_internal_preview() {
+  stop_internal_preview
+  rm -f "$PREVIEW_FIFO"
+  if ! mkfifo -m 600 "$PREVIEW_FIFO"; then
+    log "failed to create preview fifo"
+    return 1
+  fi
+  local prev=""
+  command -v xdotool >/dev/null 2>&1 && prev="$(xdotool getactivewindow 2>/dev/null)"
+  ffplay -hide_banner -loglevel error \
+    -f rawvideo -pixel_format yuv420p \
+    -video_size "${PREVIEW_WIDTH:-320}x${PREVIEW_HEIGHT:-180}" \
+    -framerate 30 -i "$PREVIEW_FIFO" \
+    -x "${PREVIEW_WIDTH:-320}" -y "${PREVIEW_HEIGHT:-180}" \
+    -noborder -alwaysontop -left "$PREVIEW_X" -top "$PREVIEW_Y" \
+    -window_title "${PREVIEW_TITLE:-Webcam Preview}" -an -autoexit \
+    >>"$LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PREVIEW_PID_FILE"
+  (
+    place_preview_window
+    if [ -n "$prev" ]; then
+      xdotool windowfocus "$prev" 2>/dev/null || true
+    fi
+  ) &
+  log "internal preview pid $pid"
+  return 0
+}
+
+stop_internal_preview() {
+  if [ -f "$PREVIEW_PID_FILE" ]; then
+    local pid i
+    pid="$(cat "$PREVIEW_PID_FILE" 2>/dev/null)"
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for i in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PREVIEW_PID_FILE"
+  fi
+  rm -f "$PREVIEW_FIFO"
+}
+
+start_control_channel() {
+  stop_control_channel
+  rm -f "$CONTROL_FIFO"
+  mkfifo -m 600 "$CONTROL_FIFO" || return 1
+  # Hold the write end open so ffmpeg's stdin does not see EOF; q is written
+  # here by `rec stop` for a graceful flush.
+  sleep 3600 > "$CONTROL_FIFO" &
+  CONTROL_HOLDER_PID=$!
+  return 0
+}
+
+stop_control_channel() {
+  if [ -n "${CONTROL_HOLDER_PID:-}" ]; then
+    kill "$CONTROL_HOLDER_PID" 2>/dev/null || true
+    wait "$CONTROL_HOLDER_PID" 2>/dev/null || true
+    CONTROL_HOLDER_PID=""
+  fi
+  rm -f "$CONTROL_FIFO"
+}
+
+progress_watch() {
+  local pid="$1" last="" same=0 f s
+  while [ -f "$RUNFLAG" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    kill -0 "$pid" 2>/dev/null || break
+    f="$(ls -t "$SESSION_DIR"/part-*.mkv 2>/dev/null | head -n1)"
+    [ -n "$f" ] || continue
+    s="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    if [ -n "$last" ] && [ "$s" = "$last" ]; then
+      same=$((same + 1))
+    else
+      same=0
+    fi
+    last="$s"
+    if [ "$same" -ge 2 ]; then
+      log "no output growth for 10s; restarting ffmpeg"
+      kill -INT "$pid" 2>/dev/null || true
+      sleep 3
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+  done
+}
+
+cleanup() {
+  stop_internal_preview
+  stop_control_channel
+  rm -f "$RUNFLAG"
+  if [ -n "${watchdog_pid:-}" ]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+  fi
+  if [ -f "$FFPID" ]; then
+    kill -INT "$(cat "$FFPID" 2>/dev/null)" 2>/dev/null || true
+  fi
+  if [ -n "${watch_pid:-}" ]; then
+    kill "$watch_pid" 2>/dev/null || true
+  fi
+  if [ -n "${inhibit_pid:-}" ]; then
+    pkill -TERM -P "$inhibit_pid" 2>/dev/null || true
+    kill -TERM "$inhibit_pid" 2>/dev/null || true
+  fi
+  rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 0' INT TERM
+
+add_segment_output() {
+  local pattern="$1"
+  cmd+=(-f segment -segment_time "$SEGMENT_SECONDS" -reset_timestamps 1
+    -strftime 1 -segment_format matroska -flush_packets 1
+    # Small, eagerly-flushed clusters: a hard kill loses ~1s, not the whole
+    # 5s Matroska buffer. flush_packets must be set on the inner muxer too.
+    -segment_format_options "cluster_time_limit=1000:cluster_size_limit=524288:flush_packets=1"
+    "$pattern")
+}
+
+build_webcam_gpu_cmd() {
+  local pattern="$1"
+  cmd=(ffmpeg -y -hide_banner -loglevel warning
+    -hwaccel cuda -hwaccel_output_format cuda -c:v mjpeg_cuvid
+    -f v4l2 -input_format "$INPUT_FORMAT" -video_size "$VIDEO_SIZE"
+    -framerate "$FRAMERATE" -i "$DEVICE")
+
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-f pulse -i "$AUDIO_SOURCE")
+  fi
+
+  # Main branch stays CUDA all the way to NVENC. The preview branch downloads
+  # 720p frames, scales them to the preview size, and converts to TV-range.
+  cmd+=(-filter_complex "[0:v]split=2[m][p];[p]hwdownload,format=nv12,scale=${PREVIEW_WIDTH:-320}:${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv,format=yuv420p[pv]")
+  cmd+=(-map "[m]")
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-map 1:a:0)
+  fi
+
+  case "$VIDEO_CODEC" in
+    hevc_nvenc)
+      cmd+=(-c:v hevc_nvenc -preset "${NVENC_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${NVENC_CQ:-30}" -b:v 0 -profile:v main -g 60
+        -bsf:v hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=5:video_full_range_flag=1)
+      ;;
+    h264_nvenc)
+      cmd+=(-c:v h264_nvenc -preset "${NVENC_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${NVENC_CQ:-30}" -b:v 0 -profile:v high -g 60
+        -bsf:v h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=5:video_full_range_flag=1)
+      ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-c:a aac -b:a "$AUDIO_BITRATE" -ac 1 -ar 48000
+      -af "aresample=async=1:first_pts=0")
+  fi
+
+  add_segment_output "$pattern"
+  cmd+=(-map "[pv]" -c:v rawvideo -an -f rawvideo "$PREVIEW_FIFO")
+  return 0
+}
+
+build_webcam_cmd() {
+  local pattern="$1"
+  if [ "${GPU_DECODE:-1}" = "1" ]; then
+    case "$VIDEO_CODEC" in
+      hevc_nvenc|h264_nvenc)
+        build_webcam_gpu_cmd "$pattern"
+        return $?
+        ;;
+    esac
+  fi
+  cmd=(ffmpeg -y -hide_banner -loglevel warning
+    -f v4l2 -input_format "$INPUT_FORMAT" -video_size "$VIDEO_SIZE"
+    -framerate "$FRAMERATE" -i "$DEVICE")
+
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-f pulse -i "$AUDIO_SOURCE")
+  fi
+
+  cmd+=(-map 0:v:0)
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-map 1:a:0)
+  fi
+
+  cmd+=(-vf "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p")
+
+  case "$VIDEO_CODEC" in
+    libsvtav1)
+      # SVT-AV1 sets colour metadata in the AV1 sequence header; the generic
+      # -color_* flags do not reach it. 1 = BT.709, color-range 0 = TV.
+      cmd+=(-c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 60
+        -svtav1-params "color-primaries=1:transfer-characteristics=1:matrix-coefficients=1:color-range=0:pred-struct=${SVT_PRED_STRUCT:-1}")
+      ;;
+    libx264)
+      cmd+=(-c:v libx264 -preset "$PRESET" -crf "$CRF" -profile:v high -level:v 4.1
+        -g 60 -keyint_min 60 -sc_threshold 0 -threads 8
+        -x264-params "colorprim=bt709:transfer=bt709:colormatrix=bt709")
+      ;;
+    hevc_nvenc)
+      cmd+=(-c:v hevc_nvenc -preset "${NVENC_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${NVENC_CQ:-30}" -b:v 0 -profile:v main -g 60
+        -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+      ;;
+    h264_nvenc)
+      cmd+=(-c:v h264_nvenc -preset "${NVENC_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${NVENC_CQ:-30}" -b:v 0 -profile:v high -g 60
+        -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+      ;;
+  esac
+
+  if [ "$AUDIO_ENABLED" = "1" ]; then
+    cmd+=(-c:a aac -b:a "$AUDIO_BITRATE" -ac 1 -ar 48000
+      -af "aresample=async=1:first_pts=0")
+  fi
+
+  add_segment_output "$pattern"
+
+  # Preview is a rawvideo FIFO read by ffplay. This replaces FFmpeg's SDL
+  # output, which is deprecated and produced broken DTS. The main recording
+  # blocks only if the preview stalls; at 320x180 that does not happen.
+  if [ "$INTERNAL_PREVIEW" = "1" ]; then
+    cmd+=(-map 0:v:0
+      -vf "scale=w=${PREVIEW_WIDTH:-320}:h=${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p"
+      -c:v rawvideo -an -f rawvideo "$PREVIEW_FIFO")
+  fi
+}
+
+build_screen_cmd() {
+  local pattern="$1" audio_mode="${AUDIO_MODE:-system}"
+  cmd=(ffmpeg -y -hide_banner -loglevel warning
+    -f x11grab -video_size "$SCREEN_SIZE" -framerate "$SCREEN_FRAMERATE"
+    -draw_mouse 1 -i ":0.0+${SCREEN_X},${SCREEN_Y}")
+
+  local amap=() afilter=""
+  case "$audio_mode" in
+    system)
+      cmd+=(-f pulse -i "$AUDIO_MONITOR")
+      amap=(-map 1:a:0)
+      ;;
+    mic)
+      cmd+=(-f pulse -i "$AUDIO_SOURCE")
+      amap=(-map 1:a:0)
+      ;;
+    both)
+      cmd+=(-f pulse -i "$AUDIO_SOURCE" -f pulse -i "$AUDIO_MONITOR")
+      afilter="[1:a]aresample=48000,volume=1.0[mic];[2:a]aresample=48000,volume=0.7[sys];[mic][sys]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[aout]"
+      amap=(-map "[aout]")
+      ;;
+    none)
+      ;;
+  esac
+
+  cmd+=(-map 0:v:0)
+  if [ "${#amap[@]}" -gt 0 ]; then
+    cmd+=("${amap[@]}")
+  fi
+  if [ -n "$afilter" ]; then
+    cmd+=(-filter_complex "$afilter")
+  fi
+
+  cmd+=(-vf "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p")
+
+  case "$SCREEN_CODEC" in
+    hevc_nvenc)
+      cmd+=(-c:v hevc_nvenc -preset "${SCREEN_PRESET:-p5}" -tune hq
+        -rc vbr -cq "$SCREEN_CQ" -b:v 0 -profile:v main -g 60)
+      ;;
+    h264_nvenc)
+      cmd+=(-c:v h264_nvenc -preset "${SCREEN_PRESET:-p5}" -tune hq
+        -rc vbr -cq "$SCREEN_CQ" -b:v 0 -profile:v high -g 60)
+      ;;
+    libx264)
+      cmd+=(-c:v libx264 -preset veryfast -crf "$SCREEN_CQ" -g 60)
+      ;;
+  esac
+
+  cmd+=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+
+  if [ "${#amap[@]}" -gt 0 ]; then
+    cmd+=(-c:a aac -b:a "${SCREEN_AUDIO_BITRATE:-192k}" -ar 48000)
+    if [ "$audio_mode" = "mic" ]; then
+      cmd+=(-ac 1)
+    else
+      cmd+=(-ac 2)
+    fi
+  fi
+
+  add_segment_output "$pattern"
+}
+
+disk_watch() {
+  while [ -f "$RUNFLAG" ]; do
+    sleep 30
+    [ -f "$RUNFLAG" ] || break
+    local avail
+    avail="$(free_gb)"
+    if [ -n "$avail" ] && (( avail < MIN_FREE_GB )); then
+      log "low disk: ${avail}G < ${MIN_FREE_GB}G — stopping"
+      notify "Low disk (${avail} GB) — stopped." 5000
+      rm -f "$RUNFLAG"
+      if [ -f "$FFPID" ]; then
+        kill -INT "$(cat "$FFPID")" 2>/dev/null || true
+      fi
+      break
+    fi
+  done
+}
+
+inhibit_pid=""
+if [ "${INHIBIT:-0}" = "1" ] && command -v systemd-inhibit >/dev/null 2>&1; then
+  systemd-inhibit --what=idle:sleep:handle-lid-switch --mode=block \
+    --why="Recording in progress" sleep infinity >/dev/null 2>&1 &
+  inhibit_pid=$!
+  echo "$inhibit_pid" > "$STATE_DIR/inhibit.pid"
+  log "inhibitor pid $inhibit_pid"
+fi
+
+disk_watch &
+watch_pid=$!
+
+run_seq=0
+consecutive_failures=0
+
+while [ -f "$RUNFLAG" ]; do
+  run_seq=$((run_seq + 1))
+  start_epoch=$(date +%s)
+  pattern="$SESSION_DIR/part-r${run_seq}-%Y-%m-%d_%H-%M-%S.mkv"
+
+  cmd=()
+  if [ "$MODE" = "screen" ]; then
+    if ! build_screen_cmd "$pattern"; then
+      log "failed to build screen command"
+      rm -f "$RUNFLAG"
+      break
+    fi
+  else
+    if ! build_webcam_cmd "$pattern"; then
+      log "failed to build webcam command"
+      rm -f "$RUNFLAG"
+      break
+    fi
+  fi
+
+  apply_mic_gain
+  if [ "$MODE" = "webcam" ] && [ "$INTERNAL_PREVIEW" = "1" ]; then
+    start_internal_preview || log "internal preview failed to start"
+  fi
+  control_ok=0
+  if start_control_channel; then
+    control_ok=1
+  else
+    log "control channel failed; stop will fall back to SIGINT"
+  fi
+  log "--- ffmpeg run $run_seq (mode=$MODE) ---"
+  if [ "$control_ok" = 1 ]; then
+    "${cmd[@]}" < "$CONTROL_FIFO" >>"$LOG" 2>&1 &
+  else
+    "${cmd[@]}" < /dev/null >>"$LOG" 2>&1 &
+  fi
+  pid=$!
+  echo "$pid" > "$FFPID"
+  log "ffmpeg pid $pid"
+
+  watchdog_pid=""
+  if [ "$MODE" = "webcam" ] && [ "$INTERNAL_PREVIEW" = "1" ]; then
+    progress_watch "$pid" &
+    watchdog_pid=$!
+  fi
+
+  # A stop requested between the loop check and ffmpeg starting.
+  if [ ! -f "$RUNFLAG" ]; then
+    kill -INT "$pid" 2>/dev/null || true
+  fi
+
+  wait "$pid"
+  rc=$?
+  rm -f "$FFPID"
+
+  if [ -n "$watchdog_pid" ]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    watchdog_pid=""
+  fi
+  stop_control_channel
+
+  if [ "$MODE" = "webcam" ] && [ "$INTERNAL_PREVIEW" = "1" ]; then
+    stop_internal_preview
+  fi
+
+  ran=$(( $(date +%s) - start_epoch ))
+  log "ffmpeg exited rc=$rc after ${ran}s"
+
+  [ -f "$RUNFLAG" ] || break
+
+  if [ "$ran" -lt 60 ]; then
+    consecutive_failures=$((consecutive_failures + 1))
+  else
+    consecutive_failures=0
+  fi
+
+  if [ "$consecutive_failures" -ge 10 ]; then
+    notify "Recorder failing — stopped." 5000
+    log "too many consecutive failures; giving up"
+    rm -f "$RUNFLAG"
+    break
+  fi
+
+  if [ "$consecutive_failures" -eq 1 ]; then
+    notify "Interrupted — retrying…"
+  fi
+
+  log "restarting in 2s (failure $consecutive_failures)"
+  sleep 2
+done
+
+kill "$watch_pid" 2>/dev/null || true
+wait "$watch_pid" 2>/dev/null || true
+
+# Release the sleep inhibitor (systemd-inhibit forks sleep as a child).
+if [ -n "$inhibit_pid" ]; then
+  pkill -TERM -P "$inhibit_pid" 2>/dev/null || true
+  kill -TERM "$inhibit_pid" 2>/dev/null || true
+fi
+rm -f "$STATE_DIR/inhibit.pid"
+
+rm -f "$FFPID" "$SUPPID"
+stop_internal_preview
+log "supervisor exiting"

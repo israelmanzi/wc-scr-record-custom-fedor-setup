@@ -1,0 +1,13 @@
+# Local recordings and test artifacts
+recordings/
+*.mp4
+*.mkv
+*.wav
+*.log
+.qa*/
+.test*/
+
+# Machine-specific configuration and local QA notes
+rec.env
+QA.md
+

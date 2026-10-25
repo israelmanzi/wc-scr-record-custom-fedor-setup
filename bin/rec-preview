@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Floating webcam preview for screen-recording mode.
+# Writes its PID, then execs ffplay in the same process so `rec` can stop it.
+# Not meant to be run by hand; use `rec screen start` or `rec preview start`.
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$SELF_DIR")"
+# shellcheck source=/dev/null
+source "$ROOT/rec.env"
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
+mkdir -p "$STATE_DIR"
+export DISPLAY="${DISPLAY:-:0.0}"
+
+echo $$ > "$STATE_DIR/preview.pid"
+
+exec ffplay -hide_banner -loglevel error \
+  -f v4l2 -input_format "$INPUT_FORMAT" -video_size "$VIDEO_SIZE" \
+  -framerate "$FRAMERATE" -i "$DEVICE" \
+  -x "${PREVIEW_WIDTH:-320}" -y "${PREVIEW_HEIGHT:-180}" \
+  -noborder -alwaysontop \
+  -left "${PREVIEW_X:-0}" -top "${PREVIEW_Y:-0}" \
+  -window_title "${PREVIEW_TITLE:-Webcam Preview}" -an
