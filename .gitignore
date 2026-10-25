@@ -11,3 +11,6 @@ recordings/
 rec.env
 QA.md
 
+# Rust build output
+ui/target/
+

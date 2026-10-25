@@ -69,10 +69,29 @@ rec list                        # recent sessions
 rec open                        # open the recordings directory
 rec preview start|stop|status   # screen-mode preview control
 rec finalize <session-dir>      # recover an interrupted session
+rec path | config               # print the recordings/config paths
 ```
 
 The two modes are mutually exclusive. Pressing the other hotkey while one is
 recording leaves the active session untouched.
+
+## Desktop UI (optional)
+
+`ui/` contains a small Rust/egui control panel that drives the same `rec` CLI.
+It shows the live state, starts and stops both modes, selects screen audio, opens
+recordings, and finalizes chunk-only sessions.
+
+Build and run:
+
+```bash
+cd ui
+cargo build --release
+./target/release/recorder-ui
+```
+
+The UI finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override. It does
+not replace the CLI or the hotkeys, and the camera preview remains a separate
+window controlled by the recorder.
 
 ## Configuration
 
@@ -189,6 +208,7 @@ bin/rec-finalize         chunk concatenation and MP4 remux
 bin/setup-hotkeys.sh     bind Super+F9/F10 in XFCE
 bin/setup-hotkey.sh      bind a single shortcut
 rec.env.example          configuration template
+ui/                      Rust/egui desktop control panel
 SETUP.md                 setup walkthrough
 README.md                this file
 ```

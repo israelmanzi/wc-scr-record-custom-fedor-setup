@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rec — webcam and screen recorder control
 #
-#   rec start                 webcam-only AV1 + floating preview (Super+F9)
+#   rec start                 webcam-only recording + floating preview (Super+F9)
 #   rec stop                  stop and finalize the active recording
 #   rec toggle                toggle webcam-only recording
 #   rec screen start [--audio=system|mic|both|none]
@@ -11,6 +11,8 @@
 #   rec list                  list recent sessions
 #   rec open                  open the recordings folder
 #   rec finalize <session-dir> finalize by hand (crash recovery)
+#   rec path                  print the recordings directory
+#   rec config                print the configuration file path
 #
 # Configuration lives in ../rec.env. Recordings land in $OUTPUT_DIR.
 set -uo pipefail
@@ -605,13 +607,15 @@ case "${1:-}" in
     ;;
   status)   show_status ;;
   list)     list_sessions ;;
+  path)     printf '%s\n' "$OUTPUT_DIR" ;;
+  config)   printf '%s\n' "$CONFIG" ;;
   open)     xdg-open "$OUTPUT_DIR" >/dev/null 2>&1 & ;;
   finalize)
     [ $# -ge 2 ] || { echo "usage: rec finalize <session-dir>" >&2; exit 1; }
     "$SELF_DIR/rec-finalize" "$2"
     ;;
   ""|help|-h|--help)
-    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "unknown command: $1 (try: rec help)" >&2

@@ -1,0 +1,8 @@
+[package]
+name = "recorder-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop control panel for the webcam/screen recorder"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "default_fonts"] }
