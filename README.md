@@ -32,6 +32,7 @@ Recordings are written as crash-safe chunks and finalized into a single MP4.
   (util-linux), `notify-send`, `systemd-inhibit`, `ffplay`.
 - Optional: XFCE for the provided hotkey setup scripts. The CLI works without
   the hotkeys.
+- Optional: a Rust toolchain to build the desktop UI.
 
 ## Install
 

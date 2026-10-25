@@ -152,3 +152,18 @@ workspaces. Move it with Alt+F7 (XFCE) or your window manager's move shortcut.
 - **Interrupted session** — run `rec finalize <session-dir>`.
 
 Each session directory contains `session-info.txt` and `recorder.log`.
+
+## 11. Desktop UI (optional)
+
+The native control panel lives in `ui/` and drives the same `rec` CLI.
+
+```bash
+cd ui
+cargo build --release
+./target/release/recorder-ui
+```
+
+It finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override. The UI
+shows the live status, starts and stops both modes, selects screen audio, opens
+recordings, and finalizes chunk-only sessions. The camera preview remains a
+separate window.
