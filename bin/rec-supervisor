@@ -55,7 +55,13 @@ RUNFLAG="$STATE_DIR/running"
 FFPID="$STATE_DIR/ffmpeg.pid"
 SUPPID="$STATE_DIR/supervisor.pid"
 LOG="$SESSION_DIR/recorder.log"
-PREVIEW_FIFO="$STATE_DIR/internal_preview.fifo"
+if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
+  PREVIEW_FIFO="${UI_PREVIEW_FIFO:-$STATE_DIR/ui_preview.fifo}"
+  PREVIEW_WIDTH="${UI_PREVIEW_WIDTH:-${PREVIEW_WIDTH:-320}}"
+  PREVIEW_HEIGHT="${UI_PREVIEW_HEIGHT:-${PREVIEW_HEIGHT:-180}}"
+else
+  PREVIEW_FIFO="$STATE_DIR/internal_preview.fifo"
+fi
 PREVIEW_PID_FILE="$STATE_DIR/internal_preview.pid"
 CONTROL_FIFO="$STATE_DIR/control.fifo"
 CONTROL_HOLDER_PID=""
@@ -118,6 +124,18 @@ place_preview_window() {
 
 start_internal_preview() {
   stop_internal_preview
+  if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
+    if [ ! -p "$PREVIEW_FIFO" ]; then
+      mkdir -p "$(dirname "$PREVIEW_FIFO")"
+      rm -f "$PREVIEW_FIFO"
+      if ! mkfifo -m 600 "$PREVIEW_FIFO"; then
+        log "failed to create UI preview fifo"
+        return 1
+      fi
+    fi
+    log "preview sink: desktop UI ($PREVIEW_FIFO)"
+    return 0
+  fi
   rm -f "$PREVIEW_FIFO"
   if ! mkfifo -m 600 "$PREVIEW_FIFO"; then
     log "failed to create preview fifo"
@@ -146,6 +164,10 @@ start_internal_preview() {
 }
 
 stop_internal_preview() {
+  if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
+    rm -f "$PREVIEW_PID_FILE"
+    return 0
+  fi
   if [ -f "$PREVIEW_PID_FILE" ]; then
     local pid i
     pid="$(cat "$PREVIEW_PID_FILE" 2>/dev/null)"
@@ -219,11 +241,19 @@ cleanup() {
   if [ -n "${watch_pid:-}" ]; then
     kill "$watch_pid" 2>/dev/null || true
   fi
+  if [ -n "${ui_watch_pid:-}" ]; then
+    kill "$ui_watch_pid" 2>/dev/null || true
+  fi
   if [ -n "${inhibit_pid:-}" ]; then
     pkill -TERM -P "$inhibit_pid" 2>/dev/null || true
     kill -TERM "$inhibit_pid" 2>/dev/null || true
   fi
-  rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+  if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
+    # The desktop UI owns the preview FIFO; it must survive the supervisor.
+    rm -f "$FFPID" "$SUPPID" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+  else
+    rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+  fi
 }
 trap cleanup EXIT
 trap 'cleanup; exit 0' INT TERM
@@ -251,7 +281,9 @@ build_webcam_gpu_cmd() {
 
   # Main branch stays CUDA all the way to NVENC. The preview branch downloads
   # 720p frames, scales them to the preview size, and converts to TV-range.
-  cmd+=(-filter_complex "[0:v]split=2[m][p];[p]hwdownload,format=nv12,scale=${PREVIEW_WIDTH:-320}:${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv,format=yuv420p[pv]")
+  local preview_format=yuv420p
+  [ "${PREVIEW_SINK:-ffplay}" = "ui" ] && preview_format=rgb24
+  cmd+=(-filter_complex "[0:v]split=2[m][p];[p]hwdownload,format=nv12,scale=${PREVIEW_WIDTH:-320}:${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv,format=${preview_format}[pv]")
   cmd+=(-map "[m]")
   if [ "$AUDIO_ENABLED" = "1" ]; then
     cmd+=(-map 1:a:0)
@@ -277,7 +309,9 @@ build_webcam_gpu_cmd() {
   fi
 
   add_segment_output "$pattern"
-  cmd+=(-map "[pv]" -c:v rawvideo -an -f rawvideo "$PREVIEW_FIFO")
+  local preview_format=yuv420p
+  [ "${PREVIEW_SINK:-ffplay}" = "ui" ] && preview_format=rgb24
+  cmd+=(-map "[pv]" -c:v rawvideo -an -f rawvideo -pix_fmt "$preview_format" "$PREVIEW_FIFO")
   return 0
 }
 
@@ -339,11 +373,14 @@ build_webcam_cmd() {
 
   # Preview is a rawvideo FIFO read by ffplay. This replaces FFmpeg's SDL
   # output, which is deprecated and produced broken DTS. The main recording
-  # blocks only if the preview stalls; at 320x180 that does not happen.
+  # blocks only if the preview stalls; at 320x180 that does not happen. With
+  # the desktop UI it is RGB24, read by the UI window.
   if [ "$INTERNAL_PREVIEW" = "1" ]; then
+    local preview_format=yuv420p
+    [ "${PREVIEW_SINK:-ffplay}" = "ui" ] && preview_format=rgb24
     cmd+=(-map 0:v:0
-      -vf "scale=w=${PREVIEW_WIDTH:-320}:h=${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p"
-      -c:v rawvideo -an -f rawvideo "$PREVIEW_FIFO")
+      -vf "scale=w=${PREVIEW_WIDTH:-320}:h=${PREVIEW_HEIGHT:-180}:in_range=full:out_range=tv:out_color_matrix=bt709,format=${preview_format}"
+      -c:v rawvideo -an -f rawvideo -pix_fmt "$preview_format" "$PREVIEW_FIFO")
   fi
 }
 
@@ -410,6 +447,27 @@ build_screen_cmd() {
   add_segment_output "$pattern"
 }
 
+ui_watch() {
+  [ "${PREVIEW_SINK:-ffplay}" = "ui" ] || return 0
+  while [ -f "$RUNFLAG" ]; do
+    sleep 2
+    [ -f "$RUNFLAG" ] || break
+    [ -f "$STATE_DIR/ui.pid" ] || break
+    local pid
+    pid="$(cat "$STATE_DIR/ui.pid" 2>/dev/null)"
+    [ -n "$pid" ] || break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      log "desktop UI exited; stopping recording"
+      notify "Preview closed — stopping." 4000
+      rm -f "$RUNFLAG"
+      if [ -f "$FFPID" ]; then
+        kill -INT "$(cat "$FFPID")" 2>/dev/null || true
+      fi
+      break
+    fi
+  done
+}
+
 disk_watch() {
   while [ -f "$RUNFLAG" ]; do
     sleep 30
@@ -439,6 +497,8 @@ fi
 
 disk_watch &
 watch_pid=$!
+ui_watch &
+ui_watch_pid=$!
 
 run_seq=0
 consecutive_failures=0

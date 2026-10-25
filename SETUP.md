@@ -90,9 +90,10 @@ For XFCE:
 bin/setup-hotkeys.sh
 ```
 
-This binds `Super+F9` to webcam mode and `Super+F10` to screen mode.
-`bin/setup-hotkey.sh '<Super>F11' screen` binds a different key. Confirm the
-shortcuts in XFCE Settings → Keyboard → Application Shortcuts.
+This binds `Super+F9` to `bin/rec-ui-show`, which shows and focuses the
+launcher (starting it if needed), and removes the old `Super+F10` binding.
+`bin/setup-hotkey.sh '<Super>F11' /path/to/bin/rec-ui-show` binds a different
+key. Confirm the shortcut in XFCE Settings → Keyboard → Application Shortcuts.
 
 ## 7. First recording
 
@@ -100,6 +101,9 @@ shortcuts in XFCE Settings → Keyboard → Application Shortcuts.
 rec start
 rec status
 rec stop
+
+# With a custom session name:
+rec start --name "Team standup"
 ```
 
 For screen recording:
@@ -119,14 +123,16 @@ rec open
 
 ## 8. Preview window
 
-The preview is a small borderless window, always on top and sticky across
-workspaces. Move it with Alt+F7 (XFCE) or your window manager's move shortcut.
+The desktop UI embeds the camera preview in its own window. When the UI is not
+running, the CLI uses a small borderless ffplay window instead.
 
 - In webcam mode it is only a preview; it is not recorded.
-- In screen mode it is part of the captured screen and therefore appears in the
-  video as the picture-in-picture bubble.
-- If the screen-mode preview is closed, the recording continues. Restart it with
-  `rec preview start`.
+- In screen mode it is visible on screen and therefore appears in the video as
+  the picture-in-picture bubble. With the UI, that bubble is the UI window.
+- The recording window follows you across workspaces while a recording is
+  active.
+- If the separate ffplay preview is closed, the recording continues. Restart it
+  with `rec preview start`. Closing the desktop UI stops the recording.
 
 ## 9. Configuration reference
 
@@ -150,6 +156,10 @@ workspaces. Move it with Alt+F7 (XFCE) or your window manager's move shortcut.
 - **Color/levels look wrong in an editor** — the GPU path is full-range
   BT.470BG; enable full-range handling or use `GPU_DECODE=0`.
 - **Interrupted session** — run `rec finalize <session-dir>`.
+- **No preview in the UI** — close other camera applications. If the UI is not
+  running, the CLI falls back to ffplay.
+- **Settings have no effect** — most values apply to the next recording;
+  preview width and height apply after restarting the UI.
 
 Each session directory contains `session-info.txt` and `recorder.log`.
 
@@ -163,7 +173,23 @@ cargo build --release
 ./target/release/recorder-ui
 ```
 
-It finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override. The UI
-shows the live status, starts and stops both modes, selects screen audio, opens
-recordings, and finalizes chunk-only sessions. The camera preview remains a
-separate window.
+The window combines the launcher and the live preview:
+
+- **Buttons** start webcam or screen recording and stop the active one.
+- **Exit** closes the launcher and finalizes an active recording.
+- The idle view shows an editable, auto-generated session name and a
+  start timer (0, 3, 5, or 10 seconds). A non-zero timer counts down before
+  recording begins.
+- **Menu → History** lists sessions, opens the recordings folder, and opens or
+  recovers recordings.
+- **Menu → Settings** edits all `rec.env` values with switches, choices, and
+  sliders. Save writes the changed values back to `rec.env`; changes apply to
+  the next recording. Preview width and height apply after restarting the app.
+- The 354×320 launcher is borderless; drag the preview to move it.
+- Menu opens in its own resizable window, so it does not enlarge the launcher.
+- While the UI is running, CLI recordings use its preview, so there is no second
+  window. Set `PREVIEW_SINK=ffplay` to opt out.
+- Closing the window stops and finalizes an active recording.
+
+It finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override. The app
+window and taskbar use the bundled icon in `ui/assets/`.

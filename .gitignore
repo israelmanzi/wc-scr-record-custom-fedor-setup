@@ -14,3 +14,5 @@ QA.md
 # Rust build output
 ui/target/
 
+# Temporary file used while saving settings
+.rec.env.tmp.*

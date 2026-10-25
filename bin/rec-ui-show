@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Show and focus the desktop launcher; start it if it is not running.
+# Bind this to Super+F9 (or your preferred key).
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$SELF_DIR")"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
+UI_PID_FILE="$STATE_DIR/ui.pid"
+UI_BIN="${RECORDER_UI_BIN:-$ROOT/ui/target/release/recorder-ui}"
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/ui-launch.lock"
+flock -w 2 9 || exit 1
+
+export DISPLAY="${DISPLAY:-:0.0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "Webcam Recorder" -u normal -t 5000 "$1" 2>/dev/null || true
+}
+
+if [ -f "$UI_PID_FILE" ]; then
+  pid="$(cat "$UI_PID_FILE" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    wid=""
+    for _ in $(seq 1 10); do
+      wid="$(xdotool search --pid "$pid" --name '^Webcam Recorder$' 2>/dev/null | head -n1)"
+      [ -n "$wid" ] && break
+      sleep 0.1
+    done
+    if [ -n "$wid" ]; then
+      xdotool windowmap "$wid" 2>/dev/null || true
+      xdotool windowactivate "$wid" 2>/dev/null \
+        || xdotool windowraise "$wid" 2>/dev/null || true
+      xdotool windowraise "$wid" 2>/dev/null || true
+      exit 0
+    fi
+    # The process is alive but its window is still being created.
+    exit 0
+  fi
+fi
+
+if [ ! -x "$UI_BIN" ]; then
+  notify "Launcher not built: run cargo build --release in ui/"
+  exit 1
+fi
+
+cd "$ROOT/ui" || exit 1
+setsid --fork "$UI_BIN" </dev/null >>"$STATE_DIR/ui.log" 2>&1 9>&-
+
+# Let the launcher claim its pid before releasing the launch lock.
+for _ in $(seq 1 20); do
+  [ -s "$UI_PID_FILE" ] && break
+  sleep 0.1
+done
+[ -s "$UI_PID_FILE" ] || notify "Launcher failed to start."

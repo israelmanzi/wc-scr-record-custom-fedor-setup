@@ -9,12 +9,14 @@ Recordings are written as crash-safe chunks and finalized into a single MP4.
 
 ## Features
 
-- Webcam-only and full-screen recording, controlled by hotkeys or CLI.
+- Webcam-only and full-screen recording, controlled by the desktop UI, a
+  launcher hotkey, or the CLI.
 - Hardware-accelerated HEVC/H.264 encoding (NVENC) and MJPG decoding (NVDEC)
   when an NVIDIA GPU is available.
 - Software AV1 (SVT-AV1, low-delay) and H.264 (x264) fallbacks.
-- Floating preview: borderless, always-on-top, and sticky across XFCE
-  workspaces.
+- Floating preview: borderless and always-on-top while recording. When the
+  desktop UI is running, the preview is embedded in its window; otherwise the
+  CLI uses a separate ffplay window.
 - Microphone, system audio, or a mix of both.
 - 10-minute Matroska chunks; a crash loses at most the current chunk.
 - Lossless remux to a single faststart MP4 on stop.
@@ -57,30 +59,49 @@ configuration walkthrough.
 
 | Hotkey | Action |
 |---|---|
-| `Super+F9` | toggle webcam recording + preview |
-| `Super+F10` | toggle screen recording + camera PiP |
+| `Super+F9` | show/focus the desktop launcher (starts it if needed) |
 
 ```bash
 rec start                       # webcam + preview
+rec start --name "Team standup" # custom session name
 rec screen start                # screen + camera PiP
 rec screen start --audio=mic    # or both / none (default: system)
+rec screen start --name "Demo"  # custom session name
 rec stop                        # stop the active recording
 rec status                      # mode, elapsed, chunks, free space, preview
 rec list                        # recent sessions
 rec open                        # open the recordings directory
+rec values                      # print the effective configuration values
 rec preview start|stop|status   # screen-mode preview control
 rec finalize <session-dir>      # recover an interrupted session
 rec path | config               # print the recordings/config paths
 ```
 
-The two modes are mutually exclusive. Pressing the other hotkey while one is
+The two modes are mutually exclusive. Starting the other mode while one is
 recording leaves the active session untouched.
 
 ## Desktop UI (optional)
 
 `ui/` contains a small Rust/egui control panel that drives the same `rec` CLI.
-It shows the live state, starts and stops both modes, selects screen audio, opens
-recordings, and finalizes chunk-only sessions.
+The window is both the launcher and the live camera preview, so recording uses
+only one window.
+
+- The main view has the preview, the recording buttons, the elapsed time, the
+  session name, the start timer (0/3/5/10 s), and Menu/Exit buttons.
+- The session name is auto-generated while idle and can be edited before
+  starting. It is used for the session folder and supports spaces.
+- Menu opens a separate window. History lists recent sessions, opens the
+  recordings folder, and opens or recovers sessions.
+- Settings edits every option in `rec.env` with real controls
+  (switches, choices, and sliders). Changes apply to the next recording; camera
+  preview resolution applies after restarting the app.
+- While the UI is running, recordings started from the UI or the CLI feed the
+  UI preview. The screen-mode recording captures the UI window as the PiP.
+- With a non-zero timer, the launcher counts down before recording starts.
+- `Super+F9` shows and focuses the launcher; it does not start a recording.
+- Closing the window stops and finalizes an active recording.
+- Launch the UI with `PREVIEW_SINK=ffplay` to force the separate ffplay
+  preview for UI-started recordings.
 
 Build and run:
 
@@ -90,9 +111,7 @@ cargo build --release
 ./target/release/recorder-ui
 ```
 
-The UI finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override. It does
-not replace the CLI or the hotkeys, and the camera preview remains a separate
-window controlled by the recorder.
+The UI finds `rec` in `PATH`; set `REC_BIN=/path/to/bin/rec` to override.
 
 ## Configuration
 
@@ -130,11 +149,12 @@ camera (preview) ──► visible in the captured screen (PiP)
 ```
 
 - **Webcam mode** runs one FFmpeg process that owns the camera. The preview is
-  a second output of the same process, delivered through a rawvideo FIFO to
-  `ffplay`.
-- **Screen mode** runs FFmpeg on `x11grab` and a separate `ffplay` preview. The
-  preview window is visible on screen, so it is captured as the PiP. This is
-  intentional: X11 full-screen capture cannot exclude a window.
+  a second output of the same process. It is written to the desktop UI through a
+  rawvideo FIFO, or to a separate ffplay window when the UI is not running.
+- **Screen mode** runs FFmpeg on `x11grab`. With the desktop UI, the UI window
+  shows the camera and is itself the visual PiP. Without the UI, a separate
+  ffplay window is placed on screen and captured. This is intentional: X11
+  full-screen capture cannot exclude a window.
 - **Chunks** are finalized by the segment muxer. On stop, the chunks are
   stream-copied into an MP4 with the index at the front. No video is re-encoded.
 - **The camera is exclusive.** A second process cannot open the same V4L2
@@ -167,6 +187,8 @@ camera (preview) ──► visible in the captured screen (PiP)
 - Stops are graceful: `rec stop` writes `q` to FFmpeg through a control FIFO;
   SIGINT is the fallback.
 - `rec finalize <dir>` is idempotent and can recover a session after a crash.
+- When the UI preview is active, the recording stops cleanly if the UI exits;
+  closing the window also stops an active recording.
 
 ## Compatibility
 
@@ -187,8 +209,8 @@ camera (preview) ──► visible in the captured screen (PiP)
   and retry.
 - **No audio** — check `pactl list short sources` and set `AUDIO_SOURCE` or
   `AUDIO_MONITOR` accordingly.
-- **Hotkeys do nothing** — run `bin/setup-hotkeys.sh` in an XFCE session, or bind
-  `bin/rec toggle` / `bin/rec screen toggle` manually.
+- **Hotkey does nothing** — run `bin/setup-hotkeys.sh` in an XFCE session, or bind
+  `bin/rec-ui-show` manually.
 - **GPU encoder error** — set `GPU_DECODE=0`, or use
   `VIDEO_CODEC="libsvtav1"`.
 - **Washed-out or crushed video in an editor** — the GPU webcam path is
@@ -206,12 +228,16 @@ bin/rec                  control CLI
 bin/rec-supervisor       recording loop, watchdogs, restarts
 bin/rec-preview          screen-mode preview window
 bin/rec-finalize         chunk concatenation and MP4 remux
-bin/setup-hotkeys.sh     bind Super+F9/F10 in XFCE
+bin/rec-ui-show           show/focus the desktop launcher
+bin/setup-hotkeys.sh     bind Super+F9 in XFCE
 bin/setup-hotkey.sh      bind a single shortcut
 rec.env.example          configuration template
 ui/                      Rust/egui desktop control panel
 SETUP.md                 setup walkthrough
 README.md                this file
 ```
+
+The desktop UI source is split between `ui/src/main.rs` (window, preview, and
+control flow) and `ui/src/config.rs` (the `rec.env` schema and editor).
 
 Recordings are written under `OUTPUT_DIR` and are not part of the repository.
