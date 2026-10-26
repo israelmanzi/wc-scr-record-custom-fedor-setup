@@ -323,14 +323,16 @@ start_session() {
     esac
   fi
 
-  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ]; then
+  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ] \
+      && [ "$INPUT_FORMAT" = "mjpeg" ]; then
     case "$VIDEO_CODEC" in
       hevc_nvenc|h264_nvenc) vdesc+=", GPU decode" ;;
     esac
   fi
 
   pixdesc="yuv420p/bt709"
-  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ]; then
+  if [ "$mode" = "webcam" ] && [ "${GPU_DECODE:-1}" = "1" ] \
+      && [ "$INPUT_FORMAT" = "mjpeg" ]; then
     case "$VIDEO_CODEC" in
       hevc_nvenc|h264_nvenc) pixdesc="yuvj420p/full-range BT.470BG" ;;
     esac

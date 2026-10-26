@@ -74,7 +74,8 @@ Alternatives:
 | TV-range BT.709 with NVENC | `GPU_DECODE=0` |
 
 NVENC uses `NVENC_CQ` and `NVENC_PRESET`; SVT-AV1 uses `CRF` and `PRESET`.
-`GPU_DECODE` applies only to NVENC modes. See the comments in `rec.env.example`
+`GPU_DECODE` applies only to MJPG input with NVENC modes; other input formats
+use CPU decode. See the comments in `rec.env.example`
 for the full option list.
 
 ## 6. Install the command and hotkeys
@@ -191,8 +192,13 @@ The window combines the launcher and the live preview:
 - **Menu → History** lists sessions, opens the recordings folder, and opens or
   recovers recordings.
 - **Menu → Settings** edits all `rec.env` values with switches, choices, and
-  sliders. Save writes the changed values back to `rec.env`; changes apply to
-  the next recording. Preview width and height apply after restarting the app.
+  sliders. The Capture section detects the selected camera's formats,
+  resolutions, and frame rates; audio fields list the available PulseAudio
+  sources; encoder choices and dependent controls follow the detected FFmpeg
+  encoders and GPU. Unsupported camera modes are removed automatically. Use
+  Refresh hardware after changing cameras or audio devices. Save writes the
+  changed values back to `rec.env`; changes apply to the next recording.
+  Preview width and height apply after restarting the app.
 - The 354×320 launcher is borderless and always on top; drag the preview to
   move it.
 - Menu opens in its own resizable window, so it does not enlarge the launcher.

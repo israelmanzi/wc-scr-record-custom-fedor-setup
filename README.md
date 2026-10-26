@@ -93,11 +93,15 @@ only one window.
   session name, the start timer (0/3/5/10 s), and Menu/Exit buttons.
 - The session name is auto-generated while idle and can be edited before
   starting. It is used for the session folder and supports spaces.
-- Menu opens a separate window. History lists recent sessions, opens the
-  recordings folder, and opens or recovers sessions.
+- Menu opens a separate window. History lists recent sessions with full names,
+  opens the recordings folder, and opens or recovers sessions.
 - Settings edits every option in `rec.env` with real controls
-  (switches, choices, and sliders). Changes apply to the next recording; camera
-  preview resolution applies after restarting the app.
+  (switches, choices, and sliders). It detects camera devices and their
+  formats, resolutions and frame rates, PulseAudio sources, and available
+  FFmpeg encoders. Unsupported camera modes are excluded, dependent encoder
+  fields are disabled, and detected mode changes need Save. Use Refresh
+  hardware after changing cameras or audio devices. Changes apply to the next
+  recording; preview resolution applies after restarting the app.
 - While the UI is running, recordings started from the UI or the CLI feed the
   UI preview. The screen-mode recording captures the UI window as the PiP.
 - While recording, the launcher shows Pause/Resume and Stop buttons. The paused
@@ -133,7 +137,7 @@ Settings live in `rec.env`. The most important options:
 | `AUDIO_SOURCE` | Microphone source; `default` uses the system default input |
 | `AUDIO_MONITOR` | System-audio source; `auto` derives the monitor of the default sink |
 | `VIDEO_CODEC` | `hevc_nvenc` (default, NVIDIA), `libsvtav1` (CPU), `h264_nvenc`, `libx264` |
-| `GPU_DECODE` | `1` uses NVDEC for NVENC modes; `0` uses CPU MJPG decode |
+| `GPU_DECODE` | `1` uses NVDEC for MJPG input with NVENC; `0` uses CPU decode. Non-MJPG input always uses CPU decode |
 | `NVENC_CQ`, `NVENC_PRESET` | NVENC quality and effort |
 | `CRF`, `PRESET`, `SVT_PRED_STRUCT` | SVT-AV1 quality and prediction structure |
 | `SCREEN_CODEC`, `SCREEN_CQ`, `SCREEN_PRESET` | Screen encoder |

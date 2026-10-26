@@ -320,7 +320,9 @@ build_webcam_gpu_cmd() {
 
 build_webcam_cmd() {
   local pattern="$1"
-  if [ "${GPU_DECODE:-1}" = "1" ]; then
+  # mjpeg_cuvid only applies to MJPG input. Other V4L2 formats use the CPU
+  # decode path even if GPU_DECODE is left enabled.
+  if [ "${GPU_DECODE:-1}" = "1" ] && [ "$INPUT_FORMAT" = "mjpeg" ]; then
     case "$VIDEO_CODEC" in
       hevc_nvenc|h264_nvenc)
         build_webcam_gpu_cmd "$pattern"

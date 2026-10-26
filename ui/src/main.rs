@@ -1,3 +1,4 @@
+mod caps;
 mod config;
 
 use config::Values;
@@ -67,6 +68,8 @@ enum Msg {
     },
     Config(Values),
     ConfigError(String),
+    Hardware(caps::Hardware, Result<caps::CameraCaps, String>, String),
+    CameraCaps(String, Result<caps::CameraCaps, String>),
     Done,
     Error(String),
 }
@@ -86,6 +89,7 @@ enum Action {
     Finalize(String),
     SaveConfig,
     ReloadConfig,
+    RefreshHardware,
     Quit,
 }
 
@@ -162,6 +166,13 @@ struct App {
     starting_recording: bool,
     name_used: bool,
     resume_guard_until: Option<Instant>,
+    hardware: caps::Hardware,
+    camera_caps: Option<caps::CameraCaps>,
+    camera_caps_device: String,
+    hardware_loading: bool,
+    camera_loading: bool,
+    hardware_error: Option<String>,
+    hardware_note: Option<String>,
     settings: Values,
     saved_settings: Values,
     config_loaded: bool,
@@ -275,6 +286,20 @@ fn start_poll(rec: PathBuf, tx: Sender<Msg>) {
     });
 }
 
+fn spawn_load_hardware(device: String, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let (hardware, camera) = caps::load_hardware(&device);
+        let _ = tx.send(Msg::Hardware(hardware, camera, device));
+    });
+}
+
+fn spawn_load_camera(device: String, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result = caps::load_camera_caps(&device);
+        let _ = tx.send(Msg::CameraCaps(device, result));
+    });
+}
+
 fn spawn_load_config(rec: PathBuf, tx: Sender<Msg>) {
     thread::spawn(move || match run_rec(&rec, &["values".to_string()]) {
         Ok(raw) => {
@@ -367,6 +392,46 @@ fn fill_session_modes(sessions: &mut [Session], output_dir: &str) {
     }
 }
 
+fn is_digits(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+}
+
+fn auto_name_date(value: &str) -> Option<(&str, &str)> {
+    let mut parts = value.split('-');
+    let year = parts.next()?;
+    let month = parts.next()?;
+    let day = parts.next()?;
+    if parts.next().is_some()
+        || year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !is_digits(year)
+        || !is_digits(month)
+        || !is_digits(day)
+    {
+        return None;
+    }
+    Some((month, day))
+}
+
+fn auto_name_time(value: &str) -> Option<(&str, &str)> {
+    let mut parts = value.split('-');
+    let hours = parts.next()?;
+    let minutes = parts.next()?;
+    let seconds = parts.next()?;
+    if parts.next().is_some()
+        || hours.len() != 2
+        || minutes.len() != 2
+        || seconds.len() != 2
+        || !is_digits(hours)
+        || !is_digits(minutes)
+        || !is_digits(seconds)
+    {
+        return None;
+    }
+    Some((hours, minutes))
+}
+
 fn session_label(name: &str) -> String {
     let base = name
         .strip_prefix("webcam-")
@@ -375,11 +440,10 @@ fn session_label(name: &str) -> String {
         .unwrap_or(name);
 
     if let Some((date, time)) = base.split_once('_') {
-        let date = date.get(5..).unwrap_or(date);
-        let hours = time.get(0..2).unwrap_or("");
-        let minutes = time.get(3..5).unwrap_or("");
-        if hours.len() == 2 && minutes.len() == 2 {
-            return format!("{date} {hours}:{minutes}");
+        if let (Some((month, day)), Some((hours, minutes))) =
+            (auto_name_date(date), auto_name_time(time))
+        {
+            return format!("{month}-{day} {hours}:{minutes}");
         }
     }
 
@@ -550,6 +614,40 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
+fn ensure_current_option(
+    mut options: Vec<(String, String)>,
+    current: &str,
+) -> Vec<(String, String)> {
+    if !options.iter().any(|(value, _)| value == current) {
+        options.push((current.to_string(), format!("{current} (unavailable)")));
+    }
+    options
+}
+
+fn choice_widget(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &str,
+    options: &[(String, String)],
+    width: f32,
+) -> Option<String> {
+    let selected = options
+        .iter()
+        .find(|(value, _)| value == current)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| current.to_string());
+    let mut value = current.to_string();
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .width(width)
+        .show_ui(ui, |ui| {
+            for (option, label) in options {
+                ui.selectable_value(&mut value, option.clone(), label.clone());
+            }
+        });
+    (value != current).then_some(value)
+}
+
 fn timer_combo(ui: &mut egui::Ui, timer: &mut u64, width: f32) {
     let combo = egui::ComboBox::from_id_salt("record-timer")
         .selected_text(egui::RichText::new(format!("{}s", *timer)).size(15.0))
@@ -651,6 +749,37 @@ fn initial_position(width: f32, height: f32, margin: f32) -> Option<egui::Pos2> 
         (screen_w - width - margin).max(0.0),
         margin.min((screen_h - height).max(0.0)),
     ))
+}
+
+fn preferred_camera_size(sizes: &std::collections::BTreeMap<String, Vec<u32>>) -> Option<String> {
+    if sizes.contains_key("1280x720") {
+        return Some("1280x720".to_string());
+    }
+    sizes
+        .keys()
+        .max_by_key(|size| {
+            let mut parts = size.split('x');
+            let width = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let height = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            width * height
+        })
+        .cloned()
+}
+
+fn preferred_frame_rate(rates: &[u32], current: u32) -> u32 {
+    rates
+        .iter()
+        .copied()
+        .filter(|rate| *rate <= current)
+        .max()
+        .or_else(|| rates.iter().copied().max())
+        .unwrap_or(current)
 }
 
 fn pin_window(active: bool) {
@@ -766,6 +895,8 @@ impl App {
         if let Some(path) = &rec {
             start_poll(path.clone(), tx.clone());
         }
+        let device = config::get(&settings, "DEVICE").to_string();
+        spawn_load_hardware(device.clone(), tx.clone());
 
         Self {
             rec,
@@ -785,6 +916,13 @@ impl App {
             starting_recording: false,
             name_used: false,
             resume_guard_until: None,
+            hardware: caps::Hardware::default(),
+            camera_caps: None,
+            camera_caps_device: device,
+            hardware_loading: true,
+            camera_loading: true,
+            hardware_error: None,
+            hardware_note: None,
             settings: settings.clone(),
             saved_settings: settings,
             config_loaded,
@@ -982,6 +1120,183 @@ impl App {
         }
     }
 
+    fn codec_options(&self, key: &str) -> Vec<(String, String)> {
+        let Some(field) = config::field(key) else {
+            return Vec::new();
+        };
+        let config::Kind::Choice(options) = field.kind else {
+            return Vec::new();
+        };
+        let all: Vec<(String, String)> = options
+            .iter()
+            .map(|(value, label)| (value.to_string(), label.to_string()))
+            .collect();
+        if self.hardware.encoders.is_empty() {
+            return all;
+        }
+        let filtered: Vec<(String, String)> = all
+            .iter()
+            .filter(|(value, _)| match value.as_str() {
+                "hevc_nvenc" | "h264_nvenc" => {
+                    self.hardware.has_nvidia && self.hardware.encoders.contains(value)
+                }
+                _ => self.hardware.encoders.contains(value),
+            })
+            .cloned()
+            .collect();
+        if filtered.is_empty() { all } else { filtered }
+    }
+
+    fn normalize_codec(&mut self, key: &str, preferred: &[&str]) -> bool {
+        let options = self.codec_options(key);
+        if options.is_empty() {
+            return false;
+        }
+        let current = config::get(&self.settings, key).to_string();
+        if options.iter().any(|(value, _)| value == &current) {
+            return false;
+        }
+        let fallback = preferred
+            .iter()
+            .find(|name| options.iter().any(|(value, _)| value == *name))
+            .map(|name| name.to_string())
+            .or_else(|| options.first().map(|(value, _)| value.clone()));
+        if let Some(value) = fallback {
+            self.settings.insert(key.to_string(), value);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn normalize_preset(&mut self) -> bool {
+        let codec = config::get(&self.settings, "VIDEO_CODEC").to_string();
+        let current = config::get(&self.settings, "PRESET").to_string();
+        let fallback = match codec.as_str() {
+            "libsvtav1" => {
+                let valid = current
+                    .parse::<u32>()
+                    .map(|value| value <= 13)
+                    .unwrap_or(false);
+                (!valid).then_some("8")
+            }
+            "libx264" => {
+                const X264_PRESETS: &[&str] = &[
+                    "ultrafast",
+                    "superfast",
+                    "veryfast",
+                    "faster",
+                    "fast",
+                    "medium",
+                    "slow",
+                    "slower",
+                    "veryslow",
+                ];
+                (!X264_PRESETS.contains(&current.as_str())).then_some("veryfast")
+            }
+            _ => None,
+        };
+        if let Some(value) = fallback {
+            self.settings
+                .insert("PRESET".to_string(), value.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn normalize_camera_selection(&mut self) -> bool {
+        let current_device = config::get(&self.settings, "DEVICE").to_string();
+        if self.camera_caps_device != current_device {
+            return false;
+        }
+        let Some(caps) = self.camera_caps.clone() else {
+            return false;
+        };
+        if caps.formats.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        let mut format = config::get(&self.settings, "INPUT_FORMAT").to_string();
+        if !caps.formats.contains_key(&format) {
+            format = if caps.formats.contains_key("mjpeg") {
+                "mjpeg".to_string()
+            } else {
+                caps.formats.keys().next().cloned().unwrap_or_default()
+            };
+            self.settings
+                .insert("INPUT_FORMAT".to_string(), format.clone());
+            changed = true;
+        }
+
+        let Some(format_caps) = caps.formats.get(&format) else {
+            return changed;
+        };
+        let mut size = config::get(&self.settings, "VIDEO_SIZE").to_string();
+        if !format_caps.sizes.contains_key(&size) {
+            size = preferred_camera_size(&format_caps.sizes).unwrap_or_default();
+            self.settings.insert("VIDEO_SIZE".to_string(), size.clone());
+            changed = true;
+        }
+
+        let Some(rates) = format_caps.sizes.get(&size) else {
+            return changed;
+        };
+        if rates.is_empty() {
+            return changed;
+        }
+        let current_rate = config::int(&self.settings, "FRAMERATE").max(0) as u32;
+        if !rates.contains(&current_rate) {
+            let rate = preferred_frame_rate(rates, current_rate);
+            self.settings
+                .insert("FRAMERATE".to_string(), rate.to_string());
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn normalize_quality_ranges(&mut self) -> bool {
+        let mut changed = false;
+        let codec = config::get(&self.settings, "VIDEO_CODEC");
+        if codec == "libx264" {
+            let current = config::int(&self.settings, "CRF");
+            let clamped = current.clamp(0, 51);
+            if current != clamped {
+                self.settings.insert("CRF".to_string(), clamped.to_string());
+                changed = true;
+            }
+        }
+        let screen_cq = config::int(&self.settings, "SCREEN_CQ");
+        let clamped = screen_cq.clamp(0, 51);
+        if screen_cq != clamped {
+            self.settings
+                .insert("SCREEN_CQ".to_string(), clamped.to_string());
+            changed = true;
+        }
+        changed
+    }
+
+    fn normalize_hardware_settings(&mut self) {
+        if !self.menu_open {
+            return;
+        }
+        let mut changed = false;
+        changed |= self.normalize_codec(
+            "VIDEO_CODEC",
+            &["libsvtav1", "libx264", "hevc_nvenc", "h264_nvenc"],
+        );
+        changed |= self.normalize_codec("SCREEN_CODEC", &["hevc_nvenc", "h264_nvenc", "libx264"]);
+        changed |= self.normalize_preset();
+        changed |= self.normalize_quality_ranges();
+        changed |= self.normalize_camera_selection();
+        if changed {
+            self.hardware_note =
+                Some("Adjusted to the detected hardware. Save to apply.".to_string());
+        }
+    }
+
     fn settings_dirty(&self) -> bool {
         self.settings != self.saved_settings
     }
@@ -990,6 +1305,30 @@ impl App {
         env::var("PREVIEW_SINK")
             .map(|value| value == "ffplay")
             .unwrap_or(false)
+    }
+
+    fn ensure_camera_caps_for_current(&mut self) {
+        let current = config::get(&self.settings, "DEVICE").to_string();
+        if self.camera_caps_device == current {
+            return;
+        }
+        self.camera_caps_device = current.clone();
+        self.camera_caps = None;
+        self.camera_loading = true;
+        self.hardware_error = None;
+        spawn_load_camera(current, self.tx.clone());
+    }
+
+    fn reload_hardware(&mut self) {
+        if self.hardware_loading {
+            return;
+        }
+        let device = config::get(&self.settings, "DEVICE").to_string();
+        self.hardware_loading = true;
+        self.camera_loading = true;
+        self.hardware_error = None;
+        self.hardware_note = None;
+        spawn_load_hardware(device, self.tx.clone());
     }
 
     fn reload_config(&mut self) {
@@ -1145,12 +1484,15 @@ impl App {
                 if !self.settings_dirty() {
                     self.reload_config();
                 }
+                self.ensure_camera_caps_for_current();
+                self.normalize_hardware_settings();
             }
             Action::ReloadConfig => {
                 if !self.settings_dirty() {
                     self.reload_config();
                 }
             }
+            Action::RefreshHardware => self.reload_hardware(),
             Action::Quit => {
                 self.quit_requested = true;
             }
@@ -1239,6 +1581,7 @@ impl App {
                     ) {
                         Ok(_) => {
                             self.saved_settings = self.settings.clone();
+                            self.hardware_note = None;
                             self.close_menu();
                         }
                         Err(error) => self.set_error(error),
@@ -1279,10 +1622,56 @@ impl App {
                     }
                     self.config_loaded = true;
                     self.config_loading = false;
+                    if self.menu_open {
+                        self.ensure_camera_caps_for_current();
+                        self.normalize_hardware_settings();
+                    }
                 }
                 Msg::ConfigError(error) => {
                     self.config_loading = false;
                     self.set_error(format!("settings: {error}"));
+                }
+                Msg::Hardware(hardware, camera, device) => {
+                    self.hardware = hardware;
+                    self.hardware_loading = false;
+                    let current = config::get(&self.settings, "DEVICE").to_string();
+                    if device == current {
+                        self.camera_loading = false;
+                        self.camera_caps_device = device;
+                        match camera {
+                            Ok(caps) => {
+                                self.camera_caps = Some(caps);
+                                self.hardware_error = None;
+                            }
+                            Err(error) => {
+                                self.camera_caps = None;
+                                self.hardware_error = Some(error);
+                            }
+                        }
+                    }
+                    if self.menu_open {
+                        self.normalize_hardware_settings();
+                    }
+                }
+                Msg::CameraCaps(device, result) => {
+                    let current = config::get(&self.settings, "DEVICE").to_string();
+                    if device == current {
+                        self.camera_loading = false;
+                        self.camera_caps_device = device;
+                        match result {
+                            Ok(caps) => {
+                                self.camera_caps = Some(caps);
+                                self.hardware_error = None;
+                            }
+                            Err(error) => {
+                                self.camera_caps = None;
+                                self.hardware_error = Some(error);
+                            }
+                        }
+                        if self.menu_open {
+                            self.normalize_hardware_settings();
+                        }
+                    }
                 }
                 Msg::Done => self.busy = false,
                 Msg::Error(text) => {
@@ -1585,9 +1974,11 @@ impl App {
     fn close_menu(&mut self) {
         self.menu_open = false;
         self.menu_initialized = false;
+        self.hardware_note = None;
         if self.settings_dirty() {
             self.settings = self.saved_settings.clone();
         }
+        self.ensure_camera_caps_for_current();
     }
 
     fn menu_window_ui(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -1661,18 +2052,16 @@ impl App {
                     }
                     shown += 1;
 
-                    ui.horizontal(|ui| {
-                        let name_width = (ui.available_width() - 210.0).max(100.0);
-                        ui.add_sized(
-                            [name_width, 22.0],
-                            egui::Label::new(
-                                egui::RichText::new(session_label(&session.name))
-                                    .monospace()
-                                    .strong(),
-                            )
-                            .truncate(),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(session_label(&session.name))
+                                .monospace()
+                                .strong(),
                         )
-                        .on_hover_text(&session.name);
+                        .wrap(),
+                    )
+                    .on_hover_text(&session.name);
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&session.mode).small().weak());
                         let duration = if session.duration == "-" {
                             "—"
@@ -1691,13 +2080,233 @@ impl App {
                             }
                         });
                     });
-                    ui.add_space(2.0);
+                    ui.add_space(6.0);
                 }
 
                 if shown == 0 {
                     ui.label(egui::RichText::new("No recordings yet").weak());
                 }
             });
+    }
+
+    fn camera_caps_current(&self) -> Option<&caps::CameraCaps> {
+        if self.camera_caps_device == config::get(&self.settings, "DEVICE") {
+            self.camera_caps.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn dynamic_options(&self, key: &str) -> Option<Vec<(String, String)>> {
+        let current = config::get(&self.settings, key).to_string();
+        let options = match key {
+            "DEVICE" => {
+                if self.hardware.devices.is_empty() {
+                    return None;
+                }
+                self.hardware
+                    .devices
+                    .iter()
+                    .map(|device| (device.path.clone(), device.name.clone()))
+                    .collect()
+            }
+            "INPUT_FORMAT" => {
+                let caps = self.camera_caps_current()?;
+                if caps.formats.is_empty() {
+                    return None;
+                }
+                caps.formats
+                    .iter()
+                    .map(|(value, format)| (value.clone(), format!("{} ({value})", format.fourcc)))
+                    .collect()
+            }
+            "VIDEO_SIZE" => {
+                let caps = self.camera_caps_current()?;
+                let format = config::get(&self.settings, "INPUT_FORMAT");
+                let sizes = &caps.formats.get(format)?.sizes;
+                if sizes.is_empty() {
+                    return None;
+                }
+                sizes
+                    .keys()
+                    .map(|size| (size.clone(), size.clone()))
+                    .collect()
+            }
+            "FRAMERATE" => {
+                let caps = self.camera_caps_current()?;
+                let format = config::get(&self.settings, "INPUT_FORMAT");
+                let size = config::get(&self.settings, "VIDEO_SIZE");
+                let rates = caps.formats.get(format)?.sizes.get(size)?;
+                if rates.is_empty() {
+                    return None;
+                }
+                rates
+                    .iter()
+                    .map(|rate| (rate.to_string(), format!("{rate} fps")))
+                    .collect()
+            }
+            "AUDIO_SOURCE" => {
+                if self.hardware.audio_sources.is_empty() {
+                    return None;
+                }
+                let mut options = vec![("default".to_string(), "System default input".to_string())];
+                options.extend(
+                    self.hardware
+                        .audio_sources
+                        .iter()
+                        .filter(|source| !source.monitor)
+                        .map(|source| (source.name.clone(), source.description.clone())),
+                );
+                options
+            }
+            "AUDIO_MONITOR" => {
+                if self.hardware.audio_sources.is_empty() {
+                    return None;
+                }
+                let mut options =
+                    vec![("auto".to_string(), "Automatic (default sink)".to_string())];
+                options.extend(
+                    self.hardware
+                        .audio_sources
+                        .iter()
+                        .filter(|source| source.monitor)
+                        .map(|source| (source.name.clone(), source.description.clone())),
+                );
+                options
+            }
+            "VIDEO_CODEC" => self.codec_options("VIDEO_CODEC"),
+            "SCREEN_CODEC" => self.codec_options("SCREEN_CODEC"),
+            "PRESET" => {
+                let codec = config::get(&self.settings, "VIDEO_CODEC");
+                match codec {
+                    "libsvtav1" => (0..=13)
+                        .map(|value| {
+                            let suffix = if value == 0 {
+                                " (fastest)"
+                            } else if value == 13 {
+                                " (slowest)"
+                            } else {
+                                ""
+                            };
+                            (value.to_string(), format!("{value}{suffix}"))
+                        })
+                        .collect(),
+                    "libx264" => [
+                        "ultrafast",
+                        "superfast",
+                        "veryfast",
+                        "faster",
+                        "fast",
+                        "medium",
+                        "slow",
+                        "slower",
+                        "veryslow",
+                        "placebo",
+                    ]
+                    .iter()
+                    .map(|value| (value.to_string(), value.to_string()))
+                    .collect(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if options.is_empty() {
+            None
+        } else {
+            Some(ensure_current_option(options, &current))
+        }
+    }
+
+    fn field_enabled(&self, key: &str) -> (bool, Option<&'static str>) {
+        let audio = config::bool_value(&self.settings, "AUDIO_ENABLED");
+        let mic_gain = audio && config::bool_value(&self.settings, "MIC_GAIN");
+        let codec = config::get(&self.settings, "VIDEO_CODEC");
+        let nvenc = matches!(codec, "hevc_nvenc" | "h264_nvenc");
+        let cpu = matches!(codec, "libsvtav1" | "libx264");
+        let input_format = config::get(&self.settings, "INPUT_FORMAT");
+        let screen_audio = config::get(&self.settings, "SCREEN_AUDIO");
+        let screen_codec = config::get(&self.settings, "SCREEN_CODEC");
+
+        match key {
+            "AUDIO_SOURCE" | "AUDIO_BITRATE" => (audio, Some("Microphone audio is disabled")),
+            "MIC_GAIN" => (audio, Some("Microphone audio is disabled")),
+            "MIC_BOOST" | "MIC_CAPTURE" => (mic_gain, Some("Enable microphone gain first")),
+            "PRESET" => (
+                cpu,
+                Some(if nvenc {
+                    "Not used by NVENC"
+                } else {
+                    "Used by CPU encoders"
+                }),
+            ),
+            "CRF" => (
+                cpu,
+                Some(if nvenc {
+                    "Not used by NVENC"
+                } else {
+                    "Used by CPU encoders"
+                }),
+            ),
+            "NVENC_CQ" | "NVENC_PRESET" => (nvenc, Some("NVENC encoders only")),
+            "GPU_DECODE" => (
+                nvenc
+                    && input_format == "mjpeg"
+                    && (self.hardware.has_mjpeg_cuvid || self.hardware.encoders.is_empty()),
+                Some("Requires NVENC, MJPEG and NVDEC"),
+            ),
+            "SVT_PRED_STRUCT" => (codec == "libsvtav1", Some("SVT-AV1 only")),
+            "SCREEN_PRESET" => (
+                screen_codec != "libx264",
+                Some("NVENC screen encoders only"),
+            ),
+            "SCREEN_AUDIO_BITRATE" => (screen_audio != "none", Some("Screen audio is off")),
+            "AUDIO_MONITOR" => (
+                matches!(screen_audio, "system" | "both"),
+                Some("Used for system audio"),
+            ),
+            _ => (true, None),
+        }
+    }
+
+    fn apply_setting_change(&mut self, key: &str, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        self.settings.insert(key.to_string(), new.to_string());
+        match key {
+            "DEVICE" => {
+                self.camera_caps = None;
+                self.camera_caps_device = new.to_string();
+                self.camera_loading = true;
+                self.hardware_error = None;
+                self.hardware_note = None;
+                spawn_load_camera(new.to_string(), self.tx.clone());
+            }
+            "INPUT_FORMAT" | "VIDEO_SIZE" | "FRAMERATE" => {
+                if self.normalize_camera_selection() {
+                    self.hardware_note = Some(
+                        "Adjusted the camera mode to supported values. Save to apply.".to_string(),
+                    );
+                }
+            }
+            "VIDEO_CODEC" => {
+                let mut adjusted = self.normalize_preset();
+                adjusted |= self.normalize_quality_ranges();
+                if adjusted {
+                    self.hardware_note = Some(
+                        "Adjusted encoder settings to match the codec. Save to apply.".to_string(),
+                    );
+                }
+            }
+            "SCREEN_CODEC" => {
+                if self.normalize_quality_ranges() {
+                    self.hardware_note =
+                        Some("Adjusted screen encoder settings. Save to apply.".to_string());
+                }
+            }
+            _ => {}
+        }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>, max_height: f32) {
@@ -1743,6 +2352,43 @@ impl App {
                 );
                 ui.add_space(4.0);
 
+                if self.hardware_loading || self.camera_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Detecting camera and audio…")
+                                .small()
+                                .weak(),
+                        );
+                    });
+                } else if let Some(error) = &self.hardware_error {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Camera unavailable: {error}"))
+                                .small()
+                                .color(ORANGE),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(error);
+                }
+                if let Some(note) = &self.hardware_note {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(note).small().color(ORANGE)).wrap(),
+                    );
+                }
+                if active_section == "Capture" && !self.hardware_loading {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Detected {} camera(s), {} audio source(s)",
+                            self.hardware.devices.len(),
+                            self.hardware.audio_sources.len()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+
                 for field in config::FIELDS
                     .iter()
                     .filter(|field| field.section == active_section)
@@ -1759,54 +2405,74 @@ impl App {
                         }
                     });
 
-                    match field.kind {
-                        config::Kind::Text => {
-                            let mut value = config::get(&self.settings, field.key).to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut value)
-                                        .desired_width(ui.available_width()),
-                                )
-                                .changed()
-                            {
-                                self.settings.insert(field.key.to_string(), value);
-                            }
-                        }
-                        config::Kind::Bool => {
-                            let mut value = config::bool_value(&self.settings, field.key);
-                            if ui.checkbox(&mut value, "").changed() {
-                                self.settings.insert(
-                                    field.key.to_string(),
-                                    if value { "1" } else { "0" }.to_string(),
-                                );
-                            }
-                        }
-                        config::Kind::Number { min, max } => {
-                            let mut value = config::int(&self.settings, field.key).clamp(min, max);
-                            if ui.add(egui::Slider::new(&mut value, min..=max)).changed() {
-                                self.settings
-                                    .insert(field.key.to_string(), value.to_string());
-                            }
-                        }
-                        config::Kind::Choice(options) => {
-                            let current = config::get(&self.settings, field.key).to_string();
-                            let selected = options
-                                .iter()
-                                .find(|(value, _)| *value == current)
-                                .map(|(_, label)| *label)
-                                .unwrap_or(current.as_str());
-                            let mut value = current.clone();
-                            egui::ComboBox::from_id_salt(field.key)
-                                .selected_text(selected)
-                                .width(ui.available_width())
-                                .show_ui(ui, |ui| {
-                                    for (option, label) in options {
-                                        ui.selectable_value(&mut value, option.to_string(), *label);
+                    let (enabled, hint) = self.field_enabled(field.key);
+                    let current = config::get(&self.settings, field.key).to_string();
+                    let mut changed = None;
+                    ui.add_enabled_ui(enabled, |ui| {
+                        if let Some(options) = self.dynamic_options(field.key) {
+                            changed = choice_widget(
+                                ui,
+                                field.key,
+                                &current,
+                                &options,
+                                ui.available_width(),
+                            );
+                        } else {
+                            match field.kind {
+                                config::Kind::Text => {
+                                    let mut value = current.clone();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut value)
+                                                .desired_width(ui.available_width()),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = Some(value);
                                     }
-                                });
-                            if value != current {
-                                self.settings.insert(field.key.to_string(), value);
+                                }
+                                config::Kind::Bool => {
+                                    let mut value = config::bool_value(&self.settings, field.key);
+                                    if ui.checkbox(&mut value, "").changed() {
+                                        changed = Some(if value {
+                                            "1".to_string()
+                                        } else {
+                                            "0".to_string()
+                                        });
+                                    }
+                                }
+                                config::Kind::Number { min, max } => {
+                                    let mut value =
+                                        config::int(&self.settings, field.key).clamp(min, max);
+                                    if ui.add(egui::Slider::new(&mut value, min..=max)).changed() {
+                                        changed = Some(value.to_string());
+                                    }
+                                }
+                                config::Kind::Choice(options) => {
+                                    let options: Vec<(String, String)> = options
+                                        .iter()
+                                        .map(|(value, label)| {
+                                            (value.to_string(), label.to_string())
+                                        })
+                                        .collect();
+                                    let options = ensure_current_option(options, &current);
+                                    changed = choice_widget(
+                                        ui,
+                                        field.key,
+                                        &current,
+                                        &options,
+                                        ui.available_width(),
+                                    );
+                                }
                             }
+                        }
+                    });
+                    if let Some(value) = changed {
+                        self.apply_setting_change(field.key, &current, &value);
+                    }
+                    if let Some(hint) = hint {
+                        if !enabled {
+                            ui.label(egui::RichText::new(hint).small().weak());
                         }
                     }
                     ui.add_space(4.0);
@@ -1824,6 +2490,8 @@ impl App {
             }
             if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
                 self.settings = self.saved_settings.clone();
+                self.hardware_note = None;
+                self.ensure_camera_caps_for_current();
             }
             if ui.button("Edit file").clicked() {
                 *action = Some(Action::EditConfig);
@@ -1838,6 +2506,15 @@ impl App {
                 if ui.button("Restart preview").clicked() {
                     *action = Some(Action::RestartPreview);
                 }
+            }
+            if ui
+                .add_enabled(
+                    !self.hardware_loading,
+                    egui::Button::new("Refresh hardware"),
+                )
+                .clicked()
+            {
+                *action = Some(Action::RefreshHardware);
             }
             if ui.button("Reload").clicked() {
                 *action = Some(Action::ReloadConfig);
@@ -2105,6 +2782,10 @@ mod tests {
         assert_eq!(session_label("2026-10-25_17-21-51"), "10-25 17:21");
         assert_eq!(session_label("session-2026-10-25_17-21-51"), "10-25 17:21");
         assert_eq!(session_label("Team standup"), "Team standup");
+        assert_eq!(
+            session_label("BIT_AI_LAB-2026-10-26_20-25-03"),
+            "BIT_AI_LAB-2026-10-26_20-25-03"
+        );
         assert_eq!(session_mode("webcam-2026-10-25_18-53-18"), "webcam");
         assert_eq!(session_mode("screen-2026-10-25_17-27-28"), "screen");
         assert_eq!(session_mode("2026-10-25_17-21-51"), "");
