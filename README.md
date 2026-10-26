@@ -104,8 +104,9 @@ only one window.
   view keeps the last frame (or live camera preview) with a Paused overlay, and
   elapsed time tracks active recording time only.
 - The launcher is always on top.
-- With a non-zero timer, the launcher counts down before recording starts. The
-  same timer is used when resuming; it can be changed in the paused view.
+- With a non-zero timer, the launcher counts down before recording starts. One
+  global timer setting is shared by recording start and resume; it can also be
+  changed while paused.
 - `Super+F9` shows and focuses the launcher; it does not start a recording.
 - Closing the window stops and finalizes an active recording.
 - Launch the UI with `PREVIEW_SINK=ffplay` to force the separate ffplay

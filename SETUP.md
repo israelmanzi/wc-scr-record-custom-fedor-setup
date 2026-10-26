@@ -185,9 +185,9 @@ The window combines the launcher and the live preview:
   recording begins.
 - Pausing stops the encoder; resuming starts a new part in the same session.
   The paused interval is left out of the final MP4 and the elapsed timer.
-- The paused view has its own Resume timer selector (0/3/5/10 seconds) using
-  the same timer as recording start; a non-zero value counts down before
-  resuming.
+- One global timer selector (0/3/5/10 seconds) is shared by recording start
+  and resume; the paused view exposes the same control. A non-zero value counts
+  down before starting or resuming.
 - **Menu → History** lists sessions, opens the recordings folder, and opens or
   recovers recordings.
 - **Menu → Settings** edits all `rec.env` values with switches, choices, and

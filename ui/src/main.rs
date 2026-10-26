@@ -157,7 +157,7 @@ struct App {
     menu_open: bool,
     menu_tab: MenuTab,
     session_name: String,
-    start_timer: u64,
+    timer_seconds: u64,
     pending_start: Option<PendingStart>,
     starting_recording: bool,
     name_used: bool,
@@ -550,6 +550,22 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
+fn timer_combo(ui: &mut egui::Ui, timer: &mut u64, width: f32) {
+    let combo = egui::ComboBox::from_id_salt("record-timer")
+        .selected_text(egui::RichText::new(format!("{}s", *timer)).size(15.0))
+        .width(width)
+        .show_ui(ui, |ui| {
+            for seconds in [0u64, 3, 5, 10] {
+                ui.selectable_value(
+                    timer,
+                    seconds,
+                    egui::RichText::new(format!("{seconds}s")).size(15.0),
+                );
+            }
+        });
+    combo.response.on_hover_text("Start and resume timer");
+}
+
 fn section_short(section: &str) -> &'static str {
     match section {
         "Capture" => "Capture",
@@ -764,7 +780,7 @@ impl App {
             menu_open: false,
             menu_tab: MenuTab::History,
             session_name: auto_session_name(),
-            start_timer: 0,
+            timer_seconds: 0,
             pending_start: None,
             starting_recording: false,
             name_used: false,
@@ -811,13 +827,13 @@ impl App {
         };
         self.session_name = name.clone();
 
-        if self.start_timer > 0 {
+        if self.timer_seconds > 0 {
             self.error = None;
             self.pending_start = Some(PendingStart {
                 mode,
                 name,
                 started: Instant::now(),
-                seconds: self.start_timer,
+                seconds: self.timer_seconds,
                 resume: false,
             });
         } else {
@@ -833,12 +849,12 @@ impl App {
             return;
         }
 
-        if self.start_timer > 0 {
+        if self.timer_seconds > 0 {
             self.pending_start = Some(PendingStart {
                 mode: self.status.mode,
                 name: String::new(),
                 started: Instant::now(),
-                seconds: self.start_timer,
+                seconds: self.timer_seconds,
                 resume: true,
             });
         } else {
@@ -1460,38 +1476,14 @@ impl App {
                         .font(egui::FontId::proportional(15.0)),
                 );
                 let _ = response.on_hover_text("Session name");
-                let combo = egui::ComboBox::from_id_salt("start-timer")
-                    .selected_text(egui::RichText::new(format!("{}s", self.start_timer)).size(15.0))
-                    .width(timer_width)
-                    .show_ui(ui, |ui| {
-                        for seconds in [0u64, 3, 5, 10] {
-                            ui.selectable_value(
-                                &mut self.start_timer,
-                                seconds,
-                                egui::RichText::new(format!("{seconds}s")).size(15.0),
-                            );
-                        }
-                    });
-                combo.response.on_hover_text("Start timer");
+                timer_combo(ui, &mut self.timer_seconds, timer_width);
             });
             ui.add_space(4.0);
         } else if status.paused {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Resume timer").small().weak());
+                ui.label(egui::RichText::new("Timer").small().weak());
                 ui.add_space(4.0);
-                let combo = egui::ComboBox::from_id_salt("resume-timer")
-                    .selected_text(egui::RichText::new(format!("{}s", self.start_timer)).size(15.0))
-                    .width(56.0)
-                    .show_ui(ui, |ui| {
-                        for seconds in [0u64, 3, 5, 10] {
-                            ui.selectable_value(
-                                &mut self.start_timer,
-                                seconds,
-                                egui::RichText::new(format!("{seconds}s")).size(15.0),
-                            );
-                        }
-                    });
-                combo.response.on_hover_text("Delay before resuming");
+                timer_combo(ui, &mut self.timer_seconds, 56.0);
             });
             ui.add_space(4.0);
         }
