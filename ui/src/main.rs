@@ -28,6 +28,7 @@ enum Mode {
 #[derive(Clone, Default)]
 struct Status {
     mode: Mode,
+    paused: bool,
     session: String,
     elapsed: String,
     preview: String,
@@ -54,6 +55,7 @@ struct PendingStart {
     name: String,
     started: Instant,
     seconds: u64,
+    resume: bool,
 }
 
 enum Msg {
@@ -74,6 +76,8 @@ enum Action {
     StartWebcam,
     StartScreen,
     Stop,
+    Pause,
+    Resume,
     RestartPreview,
     OpenFolder,
     OpenMenu,
@@ -157,6 +161,7 @@ struct App {
     pending_start: Option<PendingStart>,
     starting_recording: bool,
     name_used: bool,
+    resume_guard_until: Option<Instant>,
     settings: Values,
     saved_settings: Values,
     config_loaded: bool,
@@ -290,7 +295,8 @@ fn parse_status(raw: &str) -> Status {
         .unwrap_or("");
     let first = first.trim();
 
-    status.mode = if first.starts_with("RECORDING") {
+    status.paused = first.starts_with("PAUSED");
+    status.mode = if first.starts_with("PAUSED") || first.starts_with("RECORDING") {
         if first.contains("(screen)") {
             Mode::Screen
         } else {
@@ -762,6 +768,7 @@ impl App {
             pending_start: None,
             starting_recording: false,
             name_used: false,
+            resume_guard_until: None,
             settings: settings.clone(),
             saved_settings: settings,
             config_loaded,
@@ -811,10 +818,43 @@ impl App {
                 name,
                 started: Instant::now(),
                 seconds: self.start_timer,
+                resume: false,
             });
         } else {
             self.begin_recording(mode, &name);
         }
+    }
+
+    fn request_resume(&mut self) {
+        if self.pending_start.is_some() || self.starting_recording || self.busy {
+            return;
+        }
+        if !matches!(self.status.mode, Mode::Webcam | Mode::Screen) || !self.status.paused {
+            return;
+        }
+
+        if self.start_timer > 0 {
+            self.pending_start = Some(PendingStart {
+                mode: self.status.mode,
+                name: String::new(),
+                started: Instant::now(),
+                seconds: self.start_timer,
+                resume: true,
+            });
+        } else {
+            self.begin_resume();
+        }
+    }
+
+    fn begin_resume(&mut self) {
+        let Some(rec) = self.rec.clone() else {
+            self.set_error("recorder command not found; set REC_BIN or add rec to PATH");
+            return;
+        };
+        self.status.paused = false;
+        self.resume_guard_until = Some(Instant::now() + Duration::from_secs(2));
+        self.busy = true;
+        spawn_rec(self.tx.clone(), rec, vec!["resume".into()]);
     }
 
     fn begin_recording(&mut self, mode: Mode, name: &str) {
@@ -863,6 +903,7 @@ impl App {
         };
         let mode = pending.mode;
         let name = pending.name.clone();
+        let resume = pending.resume;
         let remaining = self.pending_remaining().unwrap_or(0);
         let (label, color) = match mode {
             Mode::Screen => ("screen", BLUE),
@@ -877,10 +918,13 @@ impl App {
         ui.horizontal(|ui| {
             status_dot(ui, color);
             ui.label(
-                egui::RichText::new(format!("Starting {label}"))
-                    .size(16.0)
-                    .strong()
-                    .color(color),
+                egui::RichText::new(format!(
+                    "{} {label}",
+                    if resume { "Resuming" } else { "Starting" }
+                ))
+                .size(16.0)
+                .strong()
+                .color(color),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1104,9 +1148,20 @@ impl App {
                 self.preview_enabled = false;
                 self.clear_preview();
                 self.stop_screen_preview();
+                self.resume_guard_until = None;
                 self.busy = true;
                 spawn_rec(self.tx.clone(), rec, vec!["stop".into()]);
             }
+            Action::Pause => {
+                let Some(rec) = self.rec.clone() else {
+                    self.set_error("recorder command not found; set REC_BIN or add rec to PATH");
+                    return;
+                };
+                self.resume_guard_until = None;
+                self.busy = true;
+                spawn_rec(self.tx.clone(), rec, vec!["pause".into()]);
+            }
+            Action::Resume => self.request_resume(),
             Action::RestartPreview => {
                 self.stop_screen_preview();
                 if let Err(error) = self.start_screen_preview() {
@@ -1180,7 +1235,14 @@ impl App {
     fn drain_messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
-                Msg::Status(status) => {
+                Msg::Status(mut status) => {
+                    if let Some(until) = self.resume_guard_until {
+                        if status.paused && Instant::now() < until {
+                            status.paused = false;
+                        } else {
+                            self.resume_guard_until = None;
+                        }
+                    }
                     let old = self.status.mode;
                     let new = status.mode;
                     self.status = status;
@@ -1209,11 +1271,16 @@ impl App {
                 Msg::Done => self.busy = false,
                 Msg::Error(text) => {
                     self.busy = false;
+                    self.resume_guard_until = None;
+                    if self.starting_recording {
+                        self.name_used = false;
+                    }
                     self.starting_recording = false;
-                    self.name_used = false;
-                    self.preview_enabled = false;
-                    self.clear_preview();
-                    self.stop_screen_preview();
+                    if !matches!(self.status.mode, Mode::Webcam | Mode::Screen) {
+                        self.preview_enabled = false;
+                        self.clear_preview();
+                        self.stop_screen_preview();
+                    }
                     self.set_error(text);
                 }
             }
@@ -1246,11 +1313,9 @@ impl App {
             return;
         }
         self.window_active = Some(active);
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if active {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
-        }));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
         pin_window(active);
     }
 
@@ -1280,6 +1345,20 @@ impl App {
                     "Camera preview",
                     egui::FontId::proportional(15.0),
                     GREY,
+                );
+            }
+            if self.status.paused {
+                let label = match self.status.mode {
+                    Mode::Screen => "Paused (screen)",
+                    _ => "Paused (webcam)",
+                };
+                painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(140));
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(18.0),
+                    ORANGE,
                 );
             }
             painter.rect_stroke(
@@ -1312,11 +1391,15 @@ impl App {
         }
 
         let status = self.status.clone();
-        let (mode_label, mode_color) = match status.mode {
-            Mode::Idle => ("Idle", GREY),
-            Mode::Webcam => ("Webcam", GREEN),
-            Mode::Screen => ("Screen", BLUE),
-            Mode::Stale => ("Interrupted", ORANGE),
+        let (mode_label, mode_color) = if status.paused {
+            ("Paused", ORANGE)
+        } else {
+            match status.mode {
+                Mode::Idle => ("Idle", GREY),
+                Mode::Webcam => ("Webcam", GREEN),
+                Mode::Screen => ("Screen", BLUE),
+                Mode::Stale => ("Interrupted", ORANGE),
+            }
         };
 
         ui.horizontal(|ui| {
@@ -1392,6 +1475,25 @@ impl App {
                 combo.response.on_hover_text("Start timer");
             });
             ui.add_space(4.0);
+        } else if status.paused {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Resume timer").small().weak());
+                ui.add_space(4.0);
+                let combo = egui::ComboBox::from_id_salt("resume-timer")
+                    .selected_text(egui::RichText::new(format!("{}s", self.start_timer)).size(15.0))
+                    .width(56.0)
+                    .show_ui(ui, |ui| {
+                        for seconds in [0u64, 3, 5, 10] {
+                            ui.selectable_value(
+                                &mut self.start_timer,
+                                seconds,
+                                egui::RichText::new(format!("{seconds}s")).size(15.0),
+                            );
+                        }
+                    });
+                combo.response.on_hover_text("Delay before resuming");
+            });
+            ui.add_space(4.0);
         }
 
         let error_text = self
@@ -1445,17 +1547,39 @@ impl App {
                 }
             }
             Mode::Webcam | Mode::Screen => {
-                let width = ui.available_width();
-                if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Button::new(egui::RichText::new("Stop").size(17.0).color(RED))
+                ui.columns(2, |columns| {
+                    let width = columns[0].available_width();
+                    let pause_label = if status.paused { "Resume" } else { "Pause" };
+                    let pause_action = if status.paused {
+                        Action::Resume
+                    } else {
+                        Action::Pause
+                    };
+                    if columns[0]
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(
+                                egui::RichText::new(pause_label)
+                                    .size(16.0)
+                                    .color(mode_color),
+                            )
                             .min_size(egui::vec2(width, 44.0)),
-                    )
-                    .clicked()
-                {
-                    *action = Some(Action::Stop);
-                }
+                        )
+                        .clicked()
+                    {
+                        *action = Some(pause_action);
+                    }
+                    if columns[1]
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(egui::RichText::new("Stop").size(16.0).color(RED))
+                                .min_size(egui::vec2(width, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        *action = Some(Action::Stop);
+                    }
+                });
             }
         }
 
@@ -1746,7 +1870,11 @@ impl eframe::App for App {
         if let Some(pending) = &self.pending_start {
             if pending.started.elapsed() >= Duration::from_secs(pending.seconds) {
                 let pending = self.pending_start.take().expect("pending start");
-                self.begin_recording(pending.mode, &pending.name);
+                if pending.resume {
+                    self.begin_resume();
+                } else {
+                    self.begin_recording(pending.mode, &pending.name);
+                }
                 ctx.request_repaint();
             }
         }
@@ -1817,16 +1945,7 @@ impl eframe::App for App {
             let mut builder = egui::ViewportBuilder::default()
                 .with_title("Recorder Menu")
                 .with_min_inner_size([480.0, 420.0])
-                .with_window_level(
-                    if matches!(self.status.mode, Mode::Webcam | Mode::Screen)
-                        || self.pending_start.is_some()
-                        || self.starting_recording
-                    {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    },
-                );
+                .with_always_on_top();
             if !self.menu_initialized {
                 let menu_w = 640.0f32.min((monitor.x - 40.0).max(480.0));
                 let menu_h = 620.0f32.min((monitor.y - 60.0).max(420.0));
@@ -1909,7 +2028,8 @@ fn main() -> eframe::Result<()> {
         .with_title("Webcam Recorder")
         .with_inner_size([WINDOW_W, WINDOW_H])
         .with_decorations(false)
-        .with_resizable(false);
+        .with_resizable(false)
+        .with_always_on_top();
 
     if let Some(position) = initial_position(WINDOW_W, WINDOW_H, margin) {
         viewport = viewport.with_position(position);
@@ -1954,6 +2074,15 @@ mod tests {
         assert_eq!(status.session, "/tmp/screen-1");
         assert_eq!(status.elapsed, "00:01:02");
         assert!(status.preview_running());
+    }
+
+    #[test]
+    fn parses_paused_status() {
+        let raw = "PAUSED (screen)\n  session : /tmp/screen-1\n  elapsed : 00:00:20\n  state   : paused\n  preview : paused\n";
+        let status = parse_status(raw);
+        assert_eq!(status.mode, Mode::Screen);
+        assert!(status.paused);
+        assert_eq!(status.elapsed, "00:00:20");
     }
 
     #[test]

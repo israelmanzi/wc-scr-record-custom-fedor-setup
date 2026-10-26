@@ -14,12 +14,13 @@ Recordings are written as crash-safe chunks and finalized into a single MP4.
 - Hardware-accelerated HEVC/H.264 encoding (NVENC) and MJPG decoding (NVDEC)
   when an NVIDIA GPU is available.
 - Software AV1 (SVT-AV1, low-delay) and H.264 (x264) fallbacks.
-- Floating preview: borderless and always-on-top while recording. When the
-  desktop UI is running, the preview is embedded in its window; otherwise the
-  CLI uses a separate ffplay window.
+- Floating preview: borderless and always on top. When the desktop UI is
+  running, the preview is embedded in its window; otherwise the CLI uses a
+  separate ffplay window.
 - Microphone, system audio, or a mix of both.
 - 10-minute Matroska chunks; a crash loses at most the current chunk.
 - Lossless remux to a single faststart MP4 on stop.
+- Pause and resume without recording the paused interval.
 - Disk-space guard, sleep inhibitor, restart and stall watchdogs,
   single-instance locking, and graceful shutdown.
 - Short desktop notifications.
@@ -67,6 +68,8 @@ rec start --name "Team standup" # custom session name
 rec screen start                # screen + camera PiP
 rec screen start --audio=mic    # or both / none (default: system)
 rec screen start --name "Demo"  # custom session name
+rec pause                       # pause the active recording
+rec resume                      # resume the active recording
 rec stop                        # stop the active recording
 rec status                      # mode, elapsed, chunks, free space, preview
 rec list                        # recent sessions
@@ -97,7 +100,12 @@ only one window.
   preview resolution applies after restarting the app.
 - While the UI is running, recordings started from the UI or the CLI feed the
   UI preview. The screen-mode recording captures the UI window as the PiP.
-- With a non-zero timer, the launcher counts down before recording starts.
+- While recording, the launcher shows Pause/Resume and Stop buttons. The paused
+  view keeps the last frame (or live camera preview) with a Paused overlay, and
+  elapsed time tracks active recording time only.
+- The launcher is always on top.
+- With a non-zero timer, the launcher counts down before recording starts. The
+  same timer is used when resuming; it can be changed in the paused view.
 - `Super+F9` shows and focuses the launcher; it does not start a recording.
 - Closing the window stops and finalizes an active recording.
 - Launch the UI with `PREVIEW_SINK=ffplay` to force the separate ffplay
@@ -186,6 +194,8 @@ camera (preview) ──► visible in the captured screen (PiP)
   starts land in the same second.
 - Stops are graceful: `rec stop` writes `q` to FFmpeg through a control FIFO;
   SIGINT is the fallback.
+- Pause stops FFmpeg cleanly and resume starts a new part in the same session.
+  Finalization concatenates the parts, so paused time is not in the MP4.
 - `rec finalize <dir>` is idempotent and can recover a session after a crash.
 - When the UI preview is active, the recording stops cleanly if the UI exits;
   closing the window also stops an active recording.

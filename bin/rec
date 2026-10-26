@@ -3,6 +3,9 @@
 #
 #   rec start [--name=NAME]   webcam-only recording + preview
 #   rec stop                  stop and finalize the active recording
+#   rec pause                 pause the active recording
+#   rec resume                resume the active recording
+#   rec toggle-pause          toggle pause/resume
 #   rec toggle                toggle webcam-only recording
 #   rec screen start [--audio=system|mic|both|none] [--name=NAME]
 #   rec screen stop|toggle|status
@@ -67,6 +70,9 @@ INTERNAL_PREVIEW_PID="$STATE_DIR/internal_preview.pid"
 INTERNAL_PREVIEW_FIFO="$STATE_DIR/internal_preview.fifo"
 INHIBIT_PID_FILE="$STATE_DIR/inhibit.pid"
 CONTROL_FIFO="$STATE_DIR/control.fifo"
+PAUSEFLAG="$STATE_DIR/paused"
+PAUSE_STARTED="$STATE_DIR/paused_at"
+PAUSED_TOTAL="$STATE_DIR/paused_total"
 
 kill_stale_inhibitor() {
   [ -f "$INHIBIT_PID_FILE" ] || return 0
@@ -393,7 +399,7 @@ start_session() {
   } > "$session/session-info.txt"
 
   rm -f "$SUPPID" "$FFPID"
-  rm -f "$CONTROL_FIFO"
+  rm -f "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
   touch "$RUNFLAG"
 
   export MODE="$mode" AUDIO_MODE="$audio"
@@ -425,7 +431,8 @@ start_session() {
     if [ -f "$FFPID" ]; then kill -TERM "$(cat "$FFPID")" 2>/dev/null || true; fi
     stop_internal_preview
     [ "$mode" = "screen" ] && stop_preview
-    rm -f "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO"
+    rm -f "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO" \
+      "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
     printf 'recording failed to start; see %s\n' "$session/recorder.log" >&2
     notify "Start failed — see log." 5000
     return 1
@@ -439,6 +446,88 @@ start_session() {
     notify "Screen recording started"
   fi
   printf '%s\n' "$session"
+}
+
+pause_session() {
+  local session="" mode="" i
+  acquire_lock 10 || { notify "Pause timed out."; return 1; }
+  [ -f "$RUNFLAG" ] || { printf 'not recording\n'; notify "Not recording."; return 1; }
+  if [ -f "$PAUSEFLAG" ]; then
+    printf 'already paused\n'
+    return 0
+  fi
+
+  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
+  mode="$(state_mode)"
+  date +%s > "$PAUSE_STARTED"
+  touch "$PAUSEFLAG"
+
+  # Ask FFmpeg to close the current part cleanly. The supervisor parks its
+  # restart loop while PAUSEFLAG exists and starts a new part on resume.
+  if [ -p "$CONTROL_FIFO" ] && [ -f "$FFPID" ]; then
+    timeout 1 sh -c 'printf "q\n" > "$1"' _ "$CONTROL_FIFO" >/dev/null 2>&1 || true
+  fi
+  for i in $(seq 1 30); do
+    [ -f "$FFPID" ] || break
+    sleep 0.1
+  done
+  if [ -f "$FFPID" ]; then
+    kill -INT "$(cat "$FFPID")" 2>/dev/null || true
+    for i in $(seq 1 30); do
+      [ -f "$FFPID" ] || break
+      sleep 0.1
+    done
+  fi
+  if [ -f "$FFPID" ]; then
+    kill -TERM "$(cat "$FFPID")" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL "$(cat "$FFPID")" 2>/dev/null || true
+  fi
+
+  printf 'paused (%s): %s\n' "${mode:-recording}" "$(basename "${session:-recording}")"
+  notify "Paused: $(basename "${session:-recording}")"
+  return 0
+}
+
+resume_session() {
+  local session="" now start total i
+  acquire_lock 10 || { notify "Resume timed out."; return 1; }
+  [ -f "$RUNFLAG" ] || { printf 'not recording\n'; notify "Not recording."; return 1; }
+  if [ ! -f "$PAUSEFLAG" ]; then
+    printf 'not paused\n'
+    return 0
+  fi
+
+  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
+  now="$(date +%s)"
+  start="$(cat "$PAUSE_STARTED" 2>/dev/null || echo "$now")"
+  total="$(cat "$PAUSED_TOTAL" 2>/dev/null || echo 0)"
+  [ "$start" -le "$now" ] 2>/dev/null || start="$now"
+  printf '%s\n' "$((total + now - start))" > "$PAUSED_TOTAL"
+
+  rm -f "$PAUSEFLAG" "$PAUSE_STARTED"
+
+  for i in $(seq 1 50); do
+    [ -f "$FFPID" ] && break
+    sleep 0.1
+  done
+
+  if [ -f "$FFPID" ]; then
+    printf 'resumed: %s\n' "$(basename "${session:-recording}")"
+    notify "Resumed: $(basename "${session:-recording}")"
+  else
+    printf 'resume requested; recorder is starting\n'
+    notify "Resume requested."
+  fi
+  return 0
+}
+
+toggle_pause_session() {
+  if [ -f "$PAUSEFLAG" ]; then
+    resume_session
+  else
+    pause_session
+  fi
 }
 
 stop_session() {
@@ -519,29 +608,46 @@ stop_session() {
     notify "Recording stopped."
   fi
 
-  rm -f "$RUNFLAG" "$FFPID" "$SUPPID" "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO"
+  rm -f "$RUNFLAG" "$FFPID" "$SUPPID" "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" \
+    "$AUDIO_FILE" "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
   return 0
 }
 
 show_status() {
-  local session="" started elapsed parts size mode
+  local session="" started elapsed parts size mode paused=0 paused_total=0 pause_started=0 now
   [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
   mode="$(state_mode)"
   compute_screen
 
   if [ -f "$RUNFLAG" ]; then
-    started="$(cat "$STARTED_FILE" 2>/dev/null || echo 0)"
-    elapsed=$(( $(date +%s) - started ))
+    now="$(date +%s)"
+    started="$(cat "$STARTED_FILE" 2>/dev/null || echo "$now")"
+    paused_total="$(cat "$PAUSED_TOTAL" 2>/dev/null || echo 0)"
+    elapsed=$(( now - started - paused_total ))
+    if [ -f "$PAUSEFLAG" ]; then
+      paused=1
+      pause_started="$(cat "$PAUSE_STARTED" 2>/dev/null || echo "$now")"
+      elapsed=$(( elapsed - (now - pause_started) ))
+    fi
+    [ "$elapsed" -ge 0 ] 2>/dev/null || elapsed=0
+
     parts="$(find "$session" -maxdepth 1 -name 'part-*.mkv' 2>/dev/null | wc -l)"
     size="$(du -sh "$session" 2>/dev/null | cut -f1)"
-    printf 'RECORDING (%s)\n' "${mode:-webcam}"
+    if [ "$paused" -eq 1 ]; then
+      printf 'PAUSED (%s)\n' "${mode:-webcam}"
+    else
+      printf 'RECORDING (%s)\n' "${mode:-webcam}"
+    fi
     printf '  session : %s\n' "$session"
     printf '  elapsed : %s\n' "$(secs_to_hms "$elapsed")"
+    printf '  state   : %s\n' "$([ "$paused" -eq 1 ] && echo paused || echo recording)"
     printf '  chunks  : %s (%s)\n' "$parts" "${size:-0}"
     printf '  free    : %s GB\n' "$(free_gb)"
     if [ "$mode" = "screen" ]; then
       printf '  audio   : %s\n' "$(cat "$AUDIO_FILE" 2>/dev/null || echo "$SCREEN_AUDIO")"
-      if [ "$PREVIEW_SINK" = "ui" ]; then
+      if [ "$paused" -eq 1 ]; then
+        printf '  preview : paused\n'
+      elif [ "$PREVIEW_SINK" = "ui" ]; then
         printf '  preview : embedded (desktop UI)\n'
       elif preview_running; then
         printf '  preview : running (%sx%s PiP at +%s,+%s)\n' \
@@ -551,7 +657,9 @@ show_status() {
       fi
     else
       printf '  audio   : mic\n'
-      if [ "$PREVIEW_SINK" = "ui" ]; then
+      if [ "$paused" -eq 1 ]; then
+        printf '  preview : paused\n'
+      elif [ "$PREVIEW_SINK" = "ui" ]; then
         printf '  preview : embedded (desktop UI)\n'
       elif [ -f "$INTERNAL_PREVIEW_PID" ] && kill -0 "$(cat "$INTERNAL_PREVIEW_PID" 2>/dev/null)" 2>/dev/null; then
         printf '  preview : running (internal ffplay)\n'
@@ -614,6 +722,9 @@ case "${1:-}" in
     start_session webcam "" "$requested_name"
     ;;
   stop)     stop_session ;;
+  pause)    pause_session ;;
+  resume)   resume_session ;;
+  toggle-pause|pause-toggle) toggle_pause_session ;;
   toggle)
     if [ -f "$RUNFLAG" ]; then
       case "$(state_mode)" in
@@ -707,7 +818,7 @@ case "${1:-}" in
     "$SELF_DIR/rec-finalize" "$2"
     ;;
   ""|help|-h|--help)
-    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "unknown command: $1 (try: rec help)" >&2

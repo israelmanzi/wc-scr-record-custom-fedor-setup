@@ -100,6 +100,8 @@ key. Confirm the shortcut in XFCE Settings → Keyboard → Application Shortcut
 ```bash
 rec start
 rec status
+rec pause
+rec resume
 rec stop
 
 # With a custom session name:
@@ -175,17 +177,24 @@ cargo build --release
 
 The window combines the launcher and the live preview:
 
-- **Buttons** start webcam or screen recording and stop the active one.
+- **Buttons** start webcam or screen recording and stop the active one. While
+  recording, Pause/Resume is next to Stop.
 - **Exit** closes the launcher and finalizes an active recording.
 - The idle view shows an editable, auto-generated session name and a
   start timer (0, 3, 5, or 10 seconds). A non-zero timer counts down before
   recording begins.
+- Pausing stops the encoder; resuming starts a new part in the same session.
+  The paused interval is left out of the final MP4 and the elapsed timer.
+- The paused view has its own Resume timer selector (0/3/5/10 seconds) using
+  the same timer as recording start; a non-zero value counts down before
+  resuming.
 - **Menu → History** lists sessions, opens the recordings folder, and opens or
   recovers recordings.
 - **Menu → Settings** edits all `rec.env` values with switches, choices, and
   sliders. Save writes the changed values back to `rec.env`; changes apply to
   the next recording. Preview width and height apply after restarting the app.
-- The 354×320 launcher is borderless; drag the preview to move it.
+- The 354×320 launcher is borderless and always on top; drag the preview to
+  move it.
 - Menu opens in its own resizable window, so it does not enlarge the launcher.
 - While the UI is running, CLI recordings use its preview, so there is no second
   window. Set `PREVIEW_SINK=ffplay` to opt out.

@@ -52,6 +52,7 @@ fi
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
 SESSION_DIR="${1:?usage: rec-supervisor <session-dir>}"
 RUNFLAG="$STATE_DIR/running"
+PAUSEFLAG="$STATE_DIR/paused"
 FFPID="$STATE_DIR/ffmpeg.pid"
 SUPPID="$STATE_DIR/supervisor.pid"
 LOG="$SESSION_DIR/recorder.log"
@@ -250,9 +251,11 @@ cleanup() {
   fi
   if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
     # The desktop UI owns the preview FIFO; it must survive the supervisor.
-    rm -f "$FFPID" "$SUPPID" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+    rm -f "$FFPID" "$SUPPID" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid" \
+      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total"
   else
-    rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid"
+    rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid" \
+      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total"
   fi
 }
 trap cleanup EXIT
@@ -504,6 +507,15 @@ run_seq=0
 consecutive_failures=0
 
 while [ -f "$RUNFLAG" ]; do
+  if [ -f "$PAUSEFLAG" ]; then
+    log "paused; waiting for resume"
+    while [ -f "$RUNFLAG" ] && [ -f "$PAUSEFLAG" ]; do
+      sleep 0.2
+    done
+    [ -f "$RUNFLAG" ] || break
+    log "resumed"
+  fi
+
   run_seq=$((run_seq + 1))
   start_epoch=$(date +%s)
   pattern="$SESSION_DIR/part-r${run_seq}-%Y-%m-%d_%H-%M-%S.mkv"
@@ -573,6 +585,12 @@ while [ -f "$RUNFLAG" ]; do
   log "ffmpeg exited rc=$rc after ${ran}s"
 
   [ -f "$RUNFLAG" ] || break
+
+  if [ -f "$PAUSEFLAG" ]; then
+    log "paused"
+    consecutive_failures=0
+    continue
+  fi
 
   if [ "$ran" -lt 60 ]; then
     consecutive_failures=$((consecutive_failures + 1))
