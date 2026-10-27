@@ -53,6 +53,8 @@ STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/webcam-rec"
 SESSION_DIR="${1:?usage: rec-supervisor <session-dir>}"
 RUNFLAG="$STATE_DIR/running"
 PAUSEFLAG="$STATE_DIR/paused"
+PRIVACYFLAG="$STATE_DIR/privacy"
+PRIVACY_PID="$STATE_DIR/privacy_capture.pid"
 FFPID="$STATE_DIR/ffmpeg.pid"
 SUPPID="$STATE_DIR/supervisor.pid"
 LOG="$SESSION_DIR/recorder.log"
@@ -230,6 +232,9 @@ progress_watch() {
 }
 
 cleanup() {
+  if command -v stop_privacy_capture >/dev/null 2>&1; then
+    stop_privacy_capture
+  fi
   stop_internal_preview
   stop_control_channel
   rm -f "$RUNFLAG"
@@ -252,10 +257,12 @@ cleanup() {
   if [ "${PREVIEW_SINK:-ffplay}" = "ui" ]; then
     # The desktop UI owns the preview FIFO; it must survive the supervisor.
     rm -f "$FFPID" "$SUPPID" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid" \
-      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total"
+      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total" \
+      "$PRIVACYFLAG" "$PRIVACY_PID"
   else
     rm -f "$FFPID" "$SUPPID" "$PREVIEW_FIFO" "$PREVIEW_PID_FILE" "$CONTROL_FIFO" "$STATE_DIR/inhibit.pid" \
-      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total"
+      "$PAUSEFLAG" "$STATE_DIR/paused_at" "$STATE_DIR/paused_total" \
+      "$PRIVACYFLAG" "$PRIVACY_PID"
   fi
 }
 trap cleanup EXIT
@@ -452,6 +459,92 @@ build_screen_cmd() {
   add_segment_output "$pattern"
 }
 
+build_privacy_cmd() {
+  local out="$1" audio_mode="${AUDIO_MODE:-$SCREEN_AUDIO}" channels=2 layout=stereo
+  case "$audio_mode" in
+    mic) channels=1; layout=mono ;;
+    none) channels=0 ;;
+    *) channels=2; layout=stereo ;;
+  esac
+  local width="${SCREEN_SIZE%x*}" height="${SCREEN_SIZE#*x}"
+
+  privacy_cmd=(ffmpeg -y -hide_banner -loglevel warning -nostdin
+    -f x11grab -video_size "$SCREEN_SIZE" -framerate "${SCREEN_FRAMERATE:-30}"
+    -draw_mouse 0 -i ":0.0+${SCREEN_X:-0},${SCREEN_Y:-0}")
+  if [ "$channels" -gt 0 ]; then
+    privacy_cmd+=(-f lavfi -i "anullsrc=r=48000:cl=${layout}")
+  fi
+  privacy_cmd+=(-map 0:v:0)
+  [ "$channels" -gt 0 ] && privacy_cmd+=(-map 1:a:0)
+  # Strong pixelation followed by upscaling: the desktop layout stays visible,
+  # but text and credentials are unreadable in the recording.
+  privacy_cmd+=(-vf "scale=iw/40:ih/40:flags=area,scale=${width}:${height}:flags=bilinear,format=yuv420p")
+
+  case "$SCREEN_CODEC" in
+    hevc_nvenc)
+      privacy_cmd+=(-c:v hevc_nvenc -preset "${SCREEN_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${SCREEN_CQ:-28}" -b:v 0 -profile:v main -g 60)
+      ;;
+    h264_nvenc)
+      privacy_cmd+=(-c:v h264_nvenc -preset "${SCREEN_PRESET:-p5}" -tune hq
+        -rc vbr -cq "${SCREEN_CQ:-28}" -b:v 0 -profile:v high -g 60)
+      ;;
+    libx264)
+      privacy_cmd+=(-c:v libx264 -preset veryfast -crf "$SCREEN_CQ" -g 60)
+      ;;
+    *)
+      log "unsupported privacy codec: $SCREEN_CODEC"
+      return 1
+      ;;
+  esac
+  privacy_cmd+=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+  if [ "$channels" -gt 0 ]; then
+    privacy_cmd+=(-c:a aac -b:a "${SCREEN_AUDIO_BITRATE:-192k}" -ar 48000 -ac "$channels")
+  fi
+  privacy_cmd+=(-f matroska -flush_packets 1
+    -cluster_time_limit 1000 -cluster_size_limit 524288 "$out")
+  return 0
+}
+
+start_privacy_capture() {
+  local pid out
+  privacy_seq=$((privacy_seq + 1))
+  out="$SESSION_DIR/part-p${privacy_seq}-$(date '+%Y-%m-%d_%H-%M-%S').mkv"
+  if ! build_privacy_cmd "$out"; then
+    return 1
+  fi
+  "${privacy_cmd[@]}" </dev/null >>"$LOG" 2>&1 &
+  pid=$!
+  echo "$pid" > "$PRIVACY_PID"
+  sleep 0.3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "privacy capture failed to start"
+    rm -f "$PRIVACY_PID"
+    return 1
+  fi
+  log "privacy capture pid $pid -> $out"
+  return 0
+}
+
+stop_privacy_capture() {
+  local pid i
+  if [ -f "$PRIVACY_PID" ]; then
+    pid="$(cat "$PRIVACY_PID" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -INT "$pid" 2>/dev/null || true
+      for i in $(seq 1 50); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.3
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PRIVACY_PID"
+  fi
+}
+
 ui_watch() {
   [ "${PREVIEW_SINK:-ffplay}" = "ui" ] || return 0
   while [ -f "$RUNFLAG" ]; do
@@ -506,9 +599,27 @@ ui_watch &
 ui_watch_pid=$!
 
 run_seq=0
+privacy_seq=0
 consecutive_failures=0
 
 while [ -f "$RUNFLAG" ]; do
+  if [ -f "$PRIVACYFLAG" ]; then
+    log "privacy mode; recording blurred screen"
+    if start_privacy_capture; then
+      while [ -f "$RUNFLAG" ] && [ -f "$PRIVACYFLAG" ]; do
+        sleep 0.2
+      done
+      stop_privacy_capture
+    else
+      log "privacy capture unavailable; holding screen recording paused"
+      while [ -f "$RUNFLAG" ] && [ -f "$PRIVACYFLAG" ]; do
+        sleep 0.2
+      done
+    fi
+    [ -f "$RUNFLAG" ] || break
+    log "privacy off"
+  fi
+
   if [ -f "$PAUSEFLAG" ]; then
     log "paused; waiting for resume"
     while [ -f "$RUNFLAG" ] && [ -f "$PAUSEFLAG" ]; do
@@ -535,6 +646,11 @@ while [ -f "$RUNFLAG" ]; do
       rm -f "$RUNFLAG"
       break
     fi
+  fi
+
+  if [ -f "$PRIVACYFLAG" ]; then
+    log "privacy requested before capture; skipping screen run"
+    continue
   fi
 
   apply_mic_gain
@@ -587,6 +703,12 @@ while [ -f "$RUNFLAG" ]; do
   log "ffmpeg exited rc=$rc after ${ran}s"
 
   [ -f "$RUNFLAG" ] || break
+
+  if [ -f "$PRIVACYFLAG" ]; then
+    log "privacy"
+    consecutive_failures=0
+    continue
+  fi
 
   if [ -f "$PAUSEFLAG" ]; then
     log "paused"

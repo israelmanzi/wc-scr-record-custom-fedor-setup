@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Toggle the screen-recording privacy blur.
+# The actual screen stays visible and usable; the recording is blurred and muted.
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+exec "$SELF_DIR/rec" privacy toggle

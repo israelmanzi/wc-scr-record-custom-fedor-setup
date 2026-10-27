@@ -21,6 +21,8 @@ Recordings are written as crash-safe chunks and finalized into a single MP4.
 - 10-minute Matroska chunks; a crash loses at most the current chunk.
 - Lossless remux to a single faststart MP4 on stop.
 - Pause and resume without recording the paused interval.
+- Privacy blur toggle for screen recordings: keep using the desktop normally
+  while the recorded interval is blurred and muted.
 - Disk-space guard, sleep inhibitor, restart and stall watchdogs,
   single-instance locking, and graceful shutdown.
 - Short desktop notifications.
@@ -61,6 +63,7 @@ configuration walkthrough.
 | Hotkey | Action |
 |---|---|
 | `Super+F9` | show/focus the desktop launcher (starts it if needed) |
+| `Super+F10` | hide/reveal screen content in the recording |
 
 ```bash
 rec start                       # webcam + preview
@@ -104,6 +107,8 @@ only one window.
   recording; preview resolution applies after restarting the app.
 - While the UI is running, recordings started from the UI or the CLI feed the
   UI preview. The screen-mode recording captures the UI window as the PiP.
+- While screen recording, the launcher also shows a Reveal control while the
+  privacy blur is active; the desktop itself is not covered.
 - While recording, the launcher shows Pause/Resume and Stop buttons. The paused
   view keeps the last frame (or live camera preview) with a Paused overlay, and
   elapsed time tracks active recording time only.
@@ -112,6 +117,9 @@ only one window.
   global timer setting is shared by recording start and resume; it can also be
   changed while paused.
 - `Super+F9` shows and focuses the launcher; it does not start a recording.
+- While screen recording, `Super+F10` hides the screen from the recording: the
+  desktop remains fully visible and usable, but the recorded video shows a
+  blurred, muted version of that interval.
 - Closing the window stops and finalizes an active recording.
 - Launch the UI with `PREVIEW_SINK=ffplay` to force the separate ffplay
   preview for UI-started recordings.
@@ -244,7 +252,8 @@ bin/rec-supervisor       recording loop, watchdogs, restarts
 bin/rec-preview          screen-mode preview window
 bin/rec-finalize         chunk concatenation and MP4 remux
 bin/rec-ui-show           show/focus the desktop launcher
-bin/setup-hotkeys.sh     bind Super+F9 in XFCE
+bin/rec-privacy           toggle the screen-recording privacy blur
+bin/setup-hotkeys.sh     bind Super+F9 and Super+F10 in XFCE
 bin/setup-hotkey.sh      bind a single shortcut
 rec.env.example          configuration template
 ui/                      Rust/egui desktop control panel

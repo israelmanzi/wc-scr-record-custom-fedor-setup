@@ -6,6 +6,7 @@
 #   rec pause                 pause the active recording
 #   rec resume                resume the active recording
 #   rec toggle-pause          toggle pause/resume
+#   rec privacy start|stop|toggle  blur screen and mute audio
 #   rec toggle                toggle webcam-only recording
 #   rec screen start [--audio=system|mic|both|none] [--name=NAME]
 #   rec screen stop|toggle|status
@@ -73,6 +74,8 @@ CONTROL_FIFO="$STATE_DIR/control.fifo"
 PAUSEFLAG="$STATE_DIR/paused"
 PAUSE_STARTED="$STATE_DIR/paused_at"
 PAUSED_TOTAL="$STATE_DIR/paused_total"
+PRIVACYFLAG="$STATE_DIR/privacy"
+PRIVACY_PID="$STATE_DIR/privacy_capture.pid"
 
 kill_stale_inhibitor() {
   [ -f "$INHIBIT_PID_FILE" ] || return 0
@@ -401,7 +404,8 @@ start_session() {
   } > "$session/session-info.txt"
 
   rm -f "$SUPPID" "$FFPID"
-  rm -f "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
+  rm -f "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL" \
+    "$PRIVACYFLAG" "$PRIVACY_PID"
   touch "$RUNFLAG"
 
   export MODE="$mode" AUDIO_MODE="$audio"
@@ -434,7 +438,7 @@ start_session() {
     stop_internal_preview
     [ "$mode" = "screen" ] && stop_preview
     rm -f "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" "$AUDIO_FILE" "$CONTROL_FIFO" \
-      "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
+      "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL" "$PRIVACYFLAG" "$PRIVACY_PID"
     printf 'recording failed to start; see %s\n' "$session/recorder.log" >&2
     notify "Start failed — see log." 5000
     return 1
@@ -450,22 +454,8 @@ start_session() {
   printf '%s\n' "$session"
 }
 
-pause_session() {
-  local session="" mode="" i
-  acquire_lock 10 || { notify "Pause timed out."; return 1; }
-  [ -f "$RUNFLAG" ] || { printf 'not recording\n'; notify "Not recording."; return 1; }
-  if [ -f "$PAUSEFLAG" ]; then
-    printf 'already paused\n'
-    return 0
-  fi
-
-  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
-  mode="$(state_mode)"
-  date +%s > "$PAUSE_STARTED"
-  touch "$PAUSEFLAG"
-
-  # Ask FFmpeg to close the current part cleanly. The supervisor parks its
-  # restart loop while PAUSEFLAG exists and starts a new part on resume.
+stop_ffmpeg_gracefully() {
+  local i
   if [ -p "$CONTROL_FIFO" ] && [ -f "$FFPID" ]; then
     timeout 1 sh -c 'printf "q\n" > "$1"' _ "$CONTROL_FIFO" >/dev/null 2>&1 || true
   fi
@@ -485,6 +475,30 @@ pause_session() {
     sleep 0.5
     kill -KILL "$(cat "$FFPID")" 2>/dev/null || true
   fi
+}
+
+pause_session() {
+  local session="" mode="" i
+  acquire_lock 10 || { notify "Pause timed out."; return 1; }
+  [ -f "$RUNFLAG" ] || { printf 'not recording\n'; notify "Not recording."; return 1; }
+  if [ -f "$PRIVACYFLAG" ]; then
+    printf 'privacy is active; reveal it first\n' >&2
+    notify "Reveal privacy first."
+    return 1
+  fi
+  if [ -f "$PAUSEFLAG" ]; then
+    printf 'already paused\n'
+    return 0
+  fi
+
+  [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
+  mode="$(state_mode)"
+  date +%s > "$PAUSE_STARTED"
+  touch "$PAUSEFLAG"
+
+  # Ask FFmpeg to close the current part cleanly. The supervisor parks its
+  # restart loop while PAUSEFLAG exists and starts a new part on resume.
+  stop_ffmpeg_gracefully
 
   printf 'paused (%s): %s\n' "${mode:-recording}" "$(basename "${session:-recording}")"
   notify "Paused: $(basename "${session:-recording}")"
@@ -530,6 +544,50 @@ toggle_pause_session() {
   else
     pause_session
   fi
+}
+
+privacy_session() {
+  local action="${1:-toggle}" mode active=0 i
+  acquire_lock 10 || { notify "Privacy timed out."; return 1; }
+  [ -f "$RUNFLAG" ] || { printf 'not recording\n'; notify "Not recording."; return 1; }
+  mode="$(state_mode)"
+  if [ "$mode" != "screen" ]; then
+    printf 'privacy mode is for screen recordings only\n' >&2
+    notify "Privacy mode is for screen recordings."
+    return 1
+  fi
+
+  [ -f "$PRIVACYFLAG" ] && active=1
+  case "$action" in
+    toggle) [ "$active" -eq 1 ] && action="stop" || action="start" ;;
+    start|stop) ;;
+    *) printf 'usage: rec privacy [start|stop|toggle]\n' >&2; return 1 ;;
+  esac
+
+  if [ "$action" = "start" ]; then
+    [ "$active" -eq 1 ] && { printf 'privacy already active\n'; return 0; }
+    [ -f "$PAUSEFLAG" ] && { notify "Screen recording is paused."; return 1; }
+    touch "$PRIVACYFLAG"
+    # The screen process may still be starting when privacy is requested.
+    for i in $(seq 1 30); do
+      [ -f "$FFPID" ] && break
+      sleep 0.1
+    done
+    stop_ffmpeg_gracefully
+    printf 'privacy: on\n'
+    notify "Privacy on — screen blurred and mic muted."
+    return 0
+  fi
+
+  [ "$active" -eq 0 ] && { printf 'privacy not active\n'; return 0; }
+  rm -f "$PRIVACYFLAG"
+  for i in $(seq 1 50); do
+    [ ! -f "$PRIVACY_PID" ] && [ -f "$FFPID" ] && break
+    sleep 0.1
+  done
+  printf 'privacy: off\n'
+  notify "Privacy off."
+  return 0
 }
 
 stop_session() {
@@ -611,15 +669,17 @@ stop_session() {
   fi
 
   rm -f "$RUNFLAG" "$FFPID" "$SUPPID" "$SESSION_FILE" "$STARTED_FILE" "$MODE_FILE" \
-    "$AUDIO_FILE" "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL"
+    "$AUDIO_FILE" "$CONTROL_FIFO" "$PAUSEFLAG" "$PAUSE_STARTED" "$PAUSED_TOTAL" \
+    "$PRIVACYFLAG" "$PRIVACY_PID"
   return 0
 }
 
 show_status() {
-  local session="" started elapsed parts size mode paused=0 paused_total=0 pause_started=0 now
+  local session="" started elapsed parts size mode paused=0 privacy=0 paused_total=0 pause_started=0 now
   [ -f "$SESSION_FILE" ] && session="$(cat "$SESSION_FILE")"
   mode="$(state_mode)"
   compute_screen
+  [ -f "$PRIVACYFLAG" ] && privacy=1
 
   if [ -f "$RUNFLAG" ]; then
     now="$(date +%s)"
@@ -635,19 +695,29 @@ show_status() {
 
     parts="$(find "$session" -maxdepth 1 -name 'part-*.mkv' 2>/dev/null | wc -l)"
     size="$(du -sh "$session" 2>/dev/null | cut -f1)"
-    if [ "$paused" -eq 1 ]; then
+    if [ "$privacy" -eq 1 ]; then
+      printf 'PRIVACY (%s)\n' "${mode:-webcam}"
+    elif [ "$paused" -eq 1 ]; then
       printf 'PAUSED (%s)\n' "${mode:-webcam}"
     else
       printf 'RECORDING (%s)\n' "${mode:-webcam}"
     fi
     printf '  session : %s\n' "$session"
     printf '  elapsed : %s\n' "$(secs_to_hms "$elapsed")"
-    printf '  state   : %s\n' "$([ "$paused" -eq 1 ] && echo paused || echo recording)"
+    if [ "$privacy" -eq 1 ]; then
+      printf '  state   : privacy\n'
+    elif [ "$paused" -eq 1 ]; then
+      printf '  state   : paused\n'
+    else
+      printf '  state   : recording\n'
+    fi
     printf '  chunks  : %s (%s)\n' "$parts" "${size:-0}"
     printf '  free    : %s GB\n' "$(free_gb)"
     if [ "$mode" = "screen" ]; then
       printf '  audio   : %s\n' "$(cat "$AUDIO_FILE" 2>/dev/null || echo "$SCREEN_AUDIO")"
-      if [ "$paused" -eq 1 ]; then
+      if [ "$privacy" -eq 1 ]; then
+        printf '  preview : privacy blur\n'
+      elif [ "$paused" -eq 1 ]; then
         printf '  preview : paused\n'
       elif [ "$PREVIEW_SINK" = "ui" ]; then
         printf '  preview : embedded (desktop UI)\n'
@@ -659,7 +729,9 @@ show_status() {
       fi
     else
       printf '  audio   : mic\n'
-      if [ "$paused" -eq 1 ]; then
+      if [ "$privacy" -eq 1 ]; then
+        printf '  preview : privacy blur\n'
+      elif [ "$paused" -eq 1 ]; then
         printf '  preview : paused\n'
       elif [ "$PREVIEW_SINK" = "ui" ]; then
         printf '  preview : embedded (desktop UI)\n'
@@ -727,6 +799,9 @@ case "${1:-}" in
   pause)    pause_session ;;
   resume)   resume_session ;;
   toggle-pause|pause-toggle) toggle_pause_session ;;
+  privacy)
+    privacy_session "${2:-toggle}"
+    ;;
   toggle)
     if [ -f "$RUNFLAG" ]; then
       case "$(state_mode)" in
@@ -820,7 +895,7 @@ case "${1:-}" in
     "$SELF_DIR/rec-finalize" "$2"
     ;;
   ""|help|-h|--help)
-    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "unknown command: $1 (try: rec help)" >&2

@@ -92,9 +92,11 @@ bin/setup-hotkeys.sh
 ```
 
 This binds `Super+F9` to `bin/rec-ui-show`, which shows and focuses the
-launcher (starting it if needed), and removes the old `Super+F10` binding.
-`bin/setup-hotkey.sh '<Super>F11' /path/to/bin/rec-ui-show` binds a different
-key. Confirm the shortcut in XFCE Settings → Keyboard → Application Shortcuts.
+launcher (starting it if needed), and `Super+F10` to `bin/rec-privacy`, which
+hides or reveals the screen while screen recording. Use
+`bin/setup-hotkey.sh '<Super>F11' /path/to/bin/rec-ui-show` for a different
+launcher key. Confirm the shortcuts in XFCE Settings → Keyboard → Application
+Shortcuts.
 
 ## 7. First recording
 
@@ -184,6 +186,9 @@ The window combines the launcher and the live preview:
 - The idle view shows an editable, auto-generated session name and a
   start timer (0, 3, 5, or 10 seconds). A non-zero timer counts down before
   recording begins.
+- While screen recording, `Super+F10` hides the screen from the recording:
+  the recorded interval is heavily blurred and its audio is muted. Your
+  desktop remains visible and usable.
 - Pausing stops the encoder; resuming starts a new part in the same session.
   The paused interval is left out of the final MP4 and the elapsed timer.
 - One global timer selector (0/3/5/10 seconds) is shared by recording start

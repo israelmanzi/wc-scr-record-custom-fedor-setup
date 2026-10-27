@@ -30,6 +30,7 @@ enum Mode {
 struct Status {
     mode: Mode,
     paused: bool,
+    privacy: bool,
     session: String,
     elapsed: String,
     preview: String,
@@ -81,6 +82,7 @@ enum Action {
     Stop,
     Pause,
     Resume,
+    PrivacyOff,
     RestartPreview,
     OpenFolder,
     OpenMenu,
@@ -321,7 +323,11 @@ fn parse_status(raw: &str) -> Status {
     let first = first.trim();
 
     status.paused = first.starts_with("PAUSED");
-    status.mode = if first.starts_with("PAUSED") || first.starts_with("RECORDING") {
+    status.privacy = first.starts_with("PRIVACY");
+    status.mode = if first.starts_with("PRIVACY")
+        || first.starts_with("PAUSED")
+        || first.starts_with("RECORDING")
+    {
         if first.contains("(screen)") {
             Mode::Screen
         } else {
@@ -1520,6 +1526,14 @@ impl App {
                 spawn_rec(self.tx.clone(), rec, vec!["pause".into()]);
             }
             Action::Resume => self.request_resume(),
+            Action::PrivacyOff => {
+                let Some(rec) = self.rec.clone() else {
+                    self.set_error("recorder command not found; set REC_BIN or add rec to PATH");
+                    return;
+                };
+                self.busy = true;
+                spawn_rec(self.tx.clone(), rec, vec!["privacy".into(), "stop".into()]);
+            }
             Action::RestartPreview => {
                 self.stop_screen_preview();
                 if let Err(error) = self.start_screen_preview() {
@@ -1602,9 +1616,23 @@ impl App {
                             self.resume_guard_until = None;
                         }
                     }
+                    let was_privacy = self.status.privacy;
                     let old = self.status.mode;
                     let new = status.mode;
                     self.status = status;
+                    if !was_privacy && self.status.privacy && self.status.mode == Mode::Screen {
+                        self.stop_screen_preview();
+                    } else if was_privacy
+                        && !self.status.privacy
+                        && self.status.mode == Mode::Screen
+                        && self.preview_ok
+                        && !self.ffplay_preview()
+                        && self.screen_preview.is_none()
+                    {
+                        if let Err(error) = self.start_screen_preview() {
+                            self.set_error(error);
+                        }
+                    }
                     self.handle_transition(old, new);
                 }
                 Msg::Sessions(sessions) => self.sessions = sessions,
@@ -1736,7 +1764,22 @@ impl App {
                 ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
             let painter = ui.painter();
             painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(24, 26, 30));
-            if let Some(texture) = &self.preview_texture {
+            if self.status.privacy {
+                painter.text(
+                    rect.center() - egui::vec2(0.0, 8.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Recording blurred",
+                    egui::FontId::proportional(18.0),
+                    ORANGE,
+                );
+                painter.text(
+                    rect.center() + egui::vec2(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Screen blurred · mic muted",
+                    egui::FontId::proportional(12.0),
+                    GREY,
+                );
+            } else if let Some(texture) = &self.preview_texture {
                 painter.image(
                     texture.id(),
                     rect,
@@ -1796,7 +1839,9 @@ impl App {
         }
 
         let status = self.status.clone();
-        let (mode_label, mode_color) = if status.paused {
+        let (mode_label, mode_color) = if status.privacy {
+            ("Privacy", ORANGE)
+        } else if status.paused {
             ("Paused", ORANGE)
         } else {
             match status.mode {
@@ -1930,17 +1975,18 @@ impl App {
             Mode::Webcam | Mode::Screen => {
                 ui.columns(2, |columns| {
                     let width = columns[0].available_width();
-                    let pause_label = if status.paused { "Resume" } else { "Pause" };
-                    let pause_action = if status.paused {
-                        Action::Resume
+                    let (primary_label, primary_action) = if status.privacy {
+                        ("Reveal", Action::PrivacyOff)
+                    } else if status.paused {
+                        ("Resume", Action::Resume)
                     } else {
-                        Action::Pause
+                        ("Pause", Action::Pause)
                     };
                     if columns[0]
                         .add_enabled(
                             enabled,
                             egui::Button::new(
-                                egui::RichText::new(pause_label)
+                                egui::RichText::new(primary_label)
                                     .size(16.0)
                                     .color(mode_color),
                             )
@@ -1948,7 +1994,7 @@ impl App {
                         )
                         .clicked()
                     {
-                        *action = Some(pause_action);
+                        *action = Some(primary_action);
                     }
                     if columns[1]
                         .add_enabled(
@@ -2743,6 +2789,15 @@ mod tests {
         assert_eq!(status.session, "/tmp/screen-1");
         assert_eq!(status.elapsed, "00:01:02");
         assert!(status.preview_running());
+    }
+
+    #[test]
+    fn parses_privacy_status() {
+        let raw = "PRIVACY (screen)\n  session : /tmp/screen-1\n  elapsed : 00:00:20\n  state   : privacy\n";
+        let status = parse_status(raw);
+        assert_eq!(status.mode, Mode::Screen);
+        assert!(status.privacy);
+        assert_eq!(status.elapsed, "00:00:20");
     }
 
     #[test]
